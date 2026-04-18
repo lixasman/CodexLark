@@ -1,0 +1,8 @@
+{
+  "assistantAppServerEnabled": true,
+  "codingAppServerEnabled": true,
+  "takeoverListLimit": 5,
+  "goalSummaryEnabled": true,
+  "goalSummaryTimeoutMs": 120000
+}
+

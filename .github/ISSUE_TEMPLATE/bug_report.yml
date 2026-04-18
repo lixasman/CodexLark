@@ -1,0 +1,141 @@
+name: Bug report
+description: 报告一个可复现的问题，帮助维护者定位飞书链路、权限或会话控制异常
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你的反馈。
+
+        提交前请注意：
+
+        - 不要粘贴真实 `FEISHU_APP_SECRET`、完整日志、会话注册表或未脱敏截图
+        - 如果你怀疑这是安全问题，请优先阅读仓库根目录的 `SECURITY.md`
+        - 如果问题涉及飞书长连接，请尽量说明是否使用管理员权限启动
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题摘要
+      description: 用 1-3 句话说明你遇到了什么问题
+      placeholder: 例如：飞书消息能进入本地服务，但创建任务后状态卡不再更新
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请尽量给出最小复现路径
+      placeholder: |
+        1. 在管理员 PowerShell 中运行 ...
+        2. 在飞书里发送 ...
+        3. 观察到 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      placeholder: 例如：应当创建任务并持续更新状态卡
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      placeholder: 例如：任务创建后立刻中断，状态卡没有刷新
+    validations:
+      required: true
+
+  - type: input
+    id: windows_version
+    attributes:
+      label: Windows 版本
+      description: 例如 Windows 11 24H2 / Windows Server 2022
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+
+  - type: input
+    id: powershell_version
+    attributes:
+      label: PowerShell 版本
+      description: 可通过 `$PSVersionTable.PSVersion` 查看
+      placeholder: 7.5.x
+    validations:
+      required: true
+
+  - type: input
+    id: node_version
+    attributes:
+      label: Node.js 版本
+      description: 可通过 `node --version` 查看
+      placeholder: v24.x
+    validations:
+      required: true
+
+  - type: dropdown
+    id: admin_launch
+    attributes:
+      label: 是否以管理员权限启动飞书长连接
+      options:
+        - 是
+        - 否
+        - 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: debug_enabled
+    attributes:
+      label: 是否开启调试日志
+      options:
+        - 是
+        - 否
+        - 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: real_feishu
+    attributes:
+      label: 是否涉及真实飞书链路
+      description: 区分真实飞书联调与纯本地构建/测试问题
+      options:
+        - 是，涉及真实飞书消息或长连接
+        - 否，只是本地构建、测试或文档问题
+        - 不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 已脱敏的日志或错误片段
+      description: 请只粘贴必要的、已经脱敏的片段
+      render: text
+      placeholder: 粘贴最关键的错误片段；不要贴完整日志文件
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 可补充配置、目录结构、关联提交、截图说明等
+      placeholder: 例如：问题从哪个提交开始出现，是否改动过 run-admin-task.ps1，是否同时开启了原始事件落盘
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认没有粘贴真实密钥、完整日志、会话注册表或未脱敏敏感信息
+          required: true
+        - label: 我已阅读 README 中的环境要求与安全提醒
+          required: true
