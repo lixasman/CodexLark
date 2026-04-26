@@ -340,6 +340,49 @@ function createTempLogFixture() {
   };
 }
 
+function createPersistedCodingRecord(
+  taskId: `T${number}`,
+  codexThreadId: string,
+  cwd: string,
+  extra?: Record<string, unknown>
+): Record<string, unknown> {
+  return {
+    taskId,
+    feishuThreadId: 'feishu:chat-1',
+    codexThreadId,
+    cwd,
+    logPath: `D:\\Workspace\\Project\\logs\\communicate\\${taskId}.log`,
+    approvalPolicy: 'on-request',
+    sandbox: 'danger-full-access',
+    sessionLifecycle: 'IDLE',
+    sessionKind: 'coding',
+    startupMode: 'resume',
+    interruptedByRestart: true,
+    ...extra
+  };
+}
+
+function createImportedTakeoverPlaceholderRecord(
+  taskId: `T${number}`,
+  codexThreadId: string,
+  cwd: string,
+  extra?: Record<string, unknown>
+): Record<string, unknown> {
+  return {
+    taskId,
+    feishuThreadId: 'feishu:chat-1',
+    codexThreadId,
+    cwd,
+    approvalPolicy: 'on-request',
+    sandbox: 'danger-full-access',
+    sessionLifecycle: 'IDLE',
+    sessionKind: 'coding',
+    startupMode: 'resume',
+    interruptedByRestart: true,
+    ...extra
+  };
+}
+
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -407,6 +450,7 @@ function createTestService(options: {
   registry?: ReturnType<typeof createMockRegistry>;
   polishRewrite?: (text: string) => Promise<string> | string;
   cliScanner?: () => Array<any>;
+  cliScannerResult?: () => { ok: true; sessions: Array<any> } | { ok: false; error: string };
   cliProcess?: {
     list: () => Array<any>;
     kill: (processes: Array<any>) => { killed: number; failed: number; errors: string[] };
@@ -452,9 +496,10 @@ function createTestService(options: {
     sessionFactory: fallbackSessionFactory,
     assistantSessionFactory: options.assistantSessionFactory,
     codingSessionFactory: options.codingSessionFactory,
-    polishRewrite: options.polishRewrite,
-    cliScanner: options.cliScanner,
-    cliProcess: options.cliProcess,
+      polishRewrite: options.polishRewrite,
+      cliScanner: options.cliScanner,
+      cliScannerResult: options.cliScannerResult,
+      cliProcess: options.cliProcess,
     sessionRegistry: registry,
     takeoverListLimit: options.takeoverListLimit,
     defaultModel: options.defaultModel,
@@ -3703,6 +3748,83 @@ test('opening the task picker keeps a warning-only empty coding task for diagnos
   assert.equal(cards.some((entry) => JSON.stringify(entry.card).includes('T1')), true);
 });
 
+test('opening the task picker stays clean after startup prunes imported takeover placeholders', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const logs = createTempLogFixture();
+  try {
+    const registry = createMockRegistry({
+      nextTaskId: 3,
+      records: [
+        {
+          taskId: 'T1',
+          feishuThreadId: 'feishu:chat-9',
+          codexThreadId: 'takeover-thread-placeholder',
+          cwd: 'D:\\Workspace\\Imported',
+          approvalPolicy: 'on-request',
+          sandbox: 'danger-full-access',
+          sessionLifecycle: 'IDLE',
+          sessionKind: 'coding',
+          startupMode: 'resume',
+          interruptedByRestart: true,
+          goalSummarySourceText: '这是误导入的 takeover 占位任务',
+          firstUserCodingText: '这是误导入的 takeover 占位任务',
+          lastCheckpointOutput: '占位输出'
+        },
+        {
+          taskId: 'T2',
+          feishuThreadId: 'feishu:chat-9',
+          codexThreadId: 'real-recovered-thread',
+          cwd: 'D:\\Workspace\\Real',
+          logPath: logs.writeLog('T2', '[2026-03-26T00:00:06.000Z] FEISHU IN 修复真实恢复任务的切换状态\n'),
+          approvalPolicy: 'on-request',
+          sandbox: 'danger-full-access',
+          sessionLifecycle: 'IDLE',
+          sessionKind: 'coding',
+          startupMode: 'resume',
+          interruptedByRestart: true,
+          goalSummarySourceText: '修复真实恢复任务的切换状态',
+          firstUserCodingText: '修复真实恢复任务的切换状态'
+        }
+      ],
+      threadUiStates: [
+        {
+          feishuThreadId: 'feishu:chat-9',
+          displayMode: 'coding',
+          statusCardMode: 'status',
+          currentCodingTaskId: 'T1',
+          statusCardMessageId: 'om_card_1'
+        }
+      ]
+    });
+    const { service } = createTestService({
+      sent: [],
+      registry,
+      session: createMockSession(),
+      sendCardImpl: async (_threadId, card) => {
+        cards.push({ kind: 'send', card });
+        return 'om_card_1';
+      },
+      updateCardImpl: async (messageId, card) => {
+        cards.push({ kind: 'update', messageId, card });
+      }
+    });
+
+    await service.handleCardAction({ threadId: 'feishu:chat-9', kind: 'open_task_picker', messageId: 'om_card_1' } as any);
+
+    const cardJson = JSON.stringify(cards.at(-1)?.card ?? {});
+    assert.deepEqual(registry.deleteSessionRecordCalls, ['T1']);
+    assert.equal(service.getTask('T1'), undefined);
+    assert.equal(registry.getSessionRecord('T1'), undefined);
+    assert.equal(registry.getThreadUiState('feishu:chat-9')?.currentCodingTaskId, undefined);
+    assert.equal(registry.getThreadUiState('feishu:chat-9')?.displayMode, 'assistant');
+    assert.equal(/切换到 T1(?!\d)/.test(cardJson), false);
+    assert.match(cardJson, /切换到 T2/);
+    assert.equal(/当前 Coding 目标：T1/.test(cardJson), false);
+  } finally {
+    logs.cleanup();
+  }
+});
+
 test('opening the task picker prunes a launcher-created empty coding task and frees its Tn', async () => {
   const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
   const registry = createMockRegistry({
@@ -5296,6 +5418,1489 @@ test('service startup discards recovered empty coding tasks without real convers
   }
 });
 
+test('service startup deletes imported takeover placeholder tasks from registry', async () => {
+  const logs = createTempLogFixture();
+  try {
+    const registry = createMockRegistry({
+      nextTaskId: 3,
+      records: [
+        {
+          taskId: 'T1',
+          feishuThreadId: 'feishu:chat-1',
+          codexThreadId: 'takeover-thread-placeholder',
+          cwd: 'D:\\Workspace\\Imported',
+          approvalPolicy: 'on-request',
+          sandbox: 'danger-full-access',
+          sessionLifecycle: 'IDLE',
+          sessionKind: 'coding',
+          startupMode: 'resume',
+          interruptedByRestart: true,
+          goalSummarySourceText: '这是误导入的 takeover 占位任务',
+          firstUserCodingText: '这是误导入的 takeover 占位任务',
+          lastCheckpointOutput: '占位输出'
+        },
+        {
+          taskId: 'T2',
+          feishuThreadId: 'feishu:chat-1',
+          codexThreadId: 'coding-thread-real',
+          cwd: 'D:\\Workspace\\Project',
+          logPath: logs.writeLog('T2', '[2026-03-26T00:00:06.000Z] FEISHU IN 修复真实恢复任务的切换状态\n'),
+          approvalPolicy: 'on-request',
+          sandbox: 'danger-full-access',
+          sessionLifecycle: 'IDLE',
+          sessionKind: 'coding',
+          startupMode: 'resume',
+          interruptedByRestart: true,
+          goalSummarySourceText: '修复真实恢复任务的切换状态',
+          firstUserCodingText: '修复真实恢复任务的切换状态'
+        }
+      ],
+      threadUiStates: [
+        {
+          feishuThreadId: 'feishu:chat-1',
+          displayMode: 'coding',
+          currentCodingTaskId: 'T1'
+        }
+      ]
+    });
+
+    const { service } = createTestService({
+      sent: [],
+      registry,
+      session: createMockSession()
+    });
+
+    assert.equal(service.getTask('T1'), undefined);
+    assert.equal(registry.getSessionRecord('T1'), undefined);
+    assert.deepEqual(registry.deleteSessionRecordCalls, ['T1']);
+    assert.equal(service.getTask('T2')?.id, 'T2');
+    assert.equal(registry.getSessionRecord('T2')?.taskId, 'T2');
+    assert.equal(registry.getThreadUiState('feishu:chat-1')?.currentCodingTaskId, undefined);
+    assert.equal(registry.getThreadUiState('feishu:chat-1')?.displayMode, 'assistant');
+  } finally {
+    logs.cleanup();
+  }
+});
+
+test('open takeover picker scans local sessions and opens first page sorted by latest activity', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 10,
+    records: [
+      createPersistedCodingRecord('T9', 'thread-existing', 'D:\\Workspace\\Existing', {
+        goalSummary: '不应优先展示的生成摘要',
+        goalSummaryStatus: 'ready',
+        goalSummarySourceText: '已有恢复任务',
+        firstUserCodingText: '已有恢复任务的完整首条用户输入',
+        lastEventAt: '2026-04-20T10:00:00.000Z'
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  let scanCalls = 0;
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => {
+      scanCalls += 1;
+      return {
+        ok: true,
+        sessions: [
+          {
+            threadId: 'thread-newer',
+            threadName: '最新本地任务',
+            cwd: 'D:\\Workspace\\Newer',
+            updatedAt: '2026-04-21T09:00:00.000Z',
+            lastText: '修复 takeover picker 的分页状态'
+          },
+          {
+            threadId: 'thread-existing',
+            threadName: '已有恢复任务',
+            cwd: 'D:\\Workspace\\Existing',
+            updatedAt: '2026-04-20T09:00:00.000Z',
+            lastText: '继续旧任务'
+          }
+        ]
+      };
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(scanCalls, 1);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'takeover_picker');
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T10', 'T9']);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerPage, 0);
+  assert.match(cardText, /本地 Codex 接管/);
+  assert.match(cardText, /快照时间：/);
+  assert.match(cardText, /任务摘要：最新本地任务/);
+  assert.match(cardText, /任务摘要：已有恢复任务的完整首条用户输入/);
+  assert.doesNotMatch(cardText, /不应优先展示的生成摘要/);
+  assert.doesNotMatch(cardText, /修复 takeover picker 的分页状态/);
+  assert.ok(cardText.indexOf('T10') >= 0 && cardText.indexOf('T9') >= 0 && cardText.indexOf('T10') < cardText.indexOf('T9'));
+});
+
+test('takeover picker truncates multiline first user summary to a single cli-style line even when thread name also exists', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  const longFirstText = '修复飞书状态卡接管摘要展示过长问题🙂并补齐本地会话分页与错误处理校验与回归用例\n第二行不应该显示';
+  const expectedSummary = `${Array.from('修复飞书状态卡接管摘要展示过长问题🙂并补齐本地会话分页与错误处理校验与回归用例')
+    .slice(0, 33)
+    .join('')}...`;
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: [
+        {
+          threadId: 'thread-1',
+          threadName: '来自 session_index 的旧线程标题',
+          cwd: 'D:\\Workspace\\Long',
+          updatedAt: '2026-04-21T09:30:00.000Z',
+          firstText: longFirstText,
+          lastText: '这是最后一轮输出，不应该作为接管摘要直接展示。'
+        }
+      ]
+    }),
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.ok(cardText.includes(`任务摘要：${expectedSummary}`));
+  assert.doesNotMatch(cardText, /来自 session_index 的旧线程标题/);
+  assert.doesNotMatch(cardText, /第二行不应该显示/);
+  assert.doesNotMatch(cardText, /这是最后一轮输出，不应该作为接管摘要直接展示/);
+  assert.equal(Array.from(expectedSummary).length, 36);
+});
+
+test('takeover picker shows imported placeholders even though normal task picker hides them', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: [
+        {
+          threadId: 'placeholder-thread',
+          threadName: '来自本地 Codex 的占位候选',
+          cwd: 'D:\\Workspace\\Placeholder',
+          updatedAt: '2026-04-21T09:30:00.000Z',
+          lastText: '这是一个只在接管列表里显示的候选'
+        }
+      ]
+    }),
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+
+  let cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.match(cardText, /T1/);
+  assert.equal(service.getTask('T1')?.startupMode, 'resume');
+  assert.equal(service.getTask('T1')?.logFilePath, undefined);
+
+  cards.length = 0;
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_task_picker', messageId: 'om_card_1' } as any);
+
+  cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.doesNotMatch(cardText, /切换到 T1/);
+  assert.match(cardText, /当前没有可切换的 Coding 任务/);
+});
+
+test('takeover picker excludes assistant sessions', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 3,
+    records: [
+      {
+        taskId: 'T1',
+        feishuThreadId: 'feishu:chat-1',
+        codexThreadId: 'assistant-thread',
+        cwd: 'D:\\Workspace\\Assistant',
+        logPath: 'D:\\Workspace\\Assistant\\logs\\communicate\\T1.log',
+        approvalPolicy: 'on-request',
+        sandbox: 'danger-full-access',
+        sessionLifecycle: 'IDLE',
+        sessionKind: 'assistant',
+        startupMode: 'resume',
+        interruptedByRestart: true
+      },
+      createPersistedCodingRecord('T2', 'coding-thread', 'D:\\Workspace\\Coding', {
+        goalSummary: '真正的 Coding 候选',
+        goalSummaryStatus: 'ready'
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: [
+        { threadId: 'assistant-thread', threadName: '助手会话', cwd: 'D:\\Workspace\\Assistant', updatedAt: '2026-04-21T08:00:00.000Z' },
+        { threadId: 'coding-thread', threadName: 'Coding 会话', cwd: 'D:\\Workspace\\Coding', updatedAt: '2026-04-21T07:00:00.000Z' }
+      ]
+    }),
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T2']);
+  assert.doesNotMatch(cardText, /T1/);
+  assert.match(cardText, /T2/);
+});
+
+test('takeover picker excludes hot managed coding sessions that are already owned by this service', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const session = createMockSession({
+    lifecycle: 'RUNNING_TURN',
+    codexThreadId: 'thread-hot'
+  });
+  const { service, registry } = createTestService({
+    sent: [],
+    registry: createMockRegistry({
+      nextTaskId: 1,
+      threadUiStates: [
+        {
+          feishuThreadId: 'feishu:chat-1',
+          displayMode: 'assistant',
+          statusCardMode: 'status',
+          statusCardMessageId: 'om_card_1'
+        }
+      ]
+    }),
+    session,
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: [
+        {
+          threadId: 'thread-hot',
+          threadName: '当前服务已托管的活跃任务',
+          cwd: 'D:\\Workspace\\Hot',
+          updatedAt: '2026-04-21T09:30:00.000Z'
+        },
+        {
+          threadId: 'thread-cold',
+          threadName: '真正可接管的本地任务',
+          cwd: 'D:\\Workspace\\Cold',
+          updatedAt: '2026-04-21T09:00:00.000Z'
+        }
+      ]
+    }),
+    sendCardImpl: async (_threadId, card) => {
+      cards.push({ kind: 'send', card });
+      return 'om_card_takeover_hot';
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleInboundMessage({ threadId: 'feishu:chat-1', text: '帮我在 D:\\Workspace\\Hot 下开一个 codex 窗口' });
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T2']);
+  assert.doesNotMatch(cardText, /T1/);
+  assert.doesNotMatch(cardText, /当前服务已托管的活跃任务/);
+  assert.match(cardText, /T2/);
+  assert.match(cardText, /真正可接管的本地任务/);
+});
+
+test('takeover picker excludes hot managed coding sessions that are owned by another Feishu thread', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const hotSession = createMockSession({
+    lifecycle: 'RUNNING_TURN',
+    codexThreadId: 'thread-hot'
+  });
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    codingSessionFactory: () => hotSession,
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: [
+        {
+          threadId: 'thread-hot',
+          threadName: '被其它飞书线程托管的活跃任务',
+          cwd: 'D:\\Workspace\\Hot',
+          updatedAt: '2026-04-21T09:30:00.000Z'
+        },
+        {
+          threadId: 'thread-cold',
+          threadName: '当前线程真正可接管的任务',
+          cwd: 'D:\\Workspace\\Cold',
+          updatedAt: '2026-04-21T09:00:00.000Z'
+        }
+      ]
+    }),
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleInboundMessage({ threadId: 'feishu:chat-2', text: '帮我在 D:\\Workspace\\Hot 下开一个 codex 窗口' });
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.deepEqual(registry.reserveCalls, ['T1', 'T2']);
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T2']);
+  assert.doesNotMatch(cardText, /T1/);
+  assert.doesNotMatch(cardText, /被其它飞书线程托管的活跃任务/);
+  assert.match(cardText, /T2/);
+  assert.match(cardText, /当前线程真正可接管的任务/);
+});
+
+test('takeover picker paginates five items per page', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: Array.from({ length: 7 }, (_, index) => ({
+        threadId: `thread-${index + 1}`,
+        threadName: `本地任务 ${index + 1}`,
+        cwd: `D:\\Workspace\\P${index + 1}`,
+        updatedAt: `2026-04-${String(21 - index).padStart(2, '0')}T08:00:00.000Z`,
+        lastText: `摘要 ${index + 1}`
+      }))
+    }),
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  const takeoverTaskIds = registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds;
+  assert.equal(Array.isArray(takeoverTaskIds) ? takeoverTaskIds.length : 0, 5);
+  assert.deepEqual(takeoverTaskIds, ['T1', 'T2', 'T3', 'T4', 'T5']);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerPage, 0);
+  assert.equal((registry.getThreadUiState('feishu:chat-1') as any)?.takeoverPickerTotalPages, 2);
+  assert.match(cardText, /第 1 \/ 2 页/);
+  assert.match(cardText, /T1/);
+  assert.match(cardText, /T5/);
+  assert.doesNotMatch(cardText, /T6/);
+  assert.doesNotMatch(cardText, /T7/);
+});
+
+test('open takeover picker only hydrates the first page and next page lazily hydrates more candidates', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  let scanCalls = 0;
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => {
+      scanCalls += 1;
+      return {
+        ok: true,
+        sessions: Array.from({ length: 7 }, (_, index) => ({
+          threadId: `thread-${index + 1}`,
+          threadName: `本地任务 ${index + 1}`,
+          cwd: `D:\\Workspace\\P${index + 1}`,
+          updatedAt: `2026-04-${String(21 - index).padStart(2, '0')}T08:00:00.000Z`,
+          lastText: `摘要 ${index + 1}`
+        }))
+      };
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+
+  let cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(scanCalls, 1);
+  assert.deepEqual(registry.reserveCalls, ['T1', 'T2', 'T3', 'T4', 'T5']);
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T1', 'T2', 'T3', 'T4', 'T5']);
+  assert.equal((registry.getThreadUiState('feishu:chat-1') as any)?.takeoverPickerTotalPages, 2);
+  assert.match(cardText, /第 1 \/ 2 页/);
+  assert.match(cardText, /T1/);
+  assert.match(cardText, /T5/);
+  assert.doesNotMatch(cardText, /T6/);
+  assert.doesNotMatch(cardText, /T7/);
+
+  cards.length = 0;
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'takeover_picker_next_page', messageId: 'om_card_1' } as any);
+
+  cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(scanCalls, 1);
+  assert.deepEqual(registry.reserveCalls, ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7']);
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T6', 'T7']);
+  assert.equal((registry.getThreadUiState('feishu:chat-1') as any)?.takeoverPickerTotalPages, 2);
+  assert.match(cardText, /第 2 \/ 2 页/);
+  assert.match(cardText, /T6/);
+  assert.match(cardText, /T7/);
+  assert.doesNotMatch(cardText, /T1/);
+  assert.doesNotMatch(cardText, /T5/);
+});
+
+test('takeover picker next page does not rescan', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 8,
+    records: Array.from({ length: 7 }, (_, index) =>
+      createPersistedCodingRecord(
+        `T${index + 1}` as `T${number}`,
+        `thread-${index + 1}`,
+        `D:\\Workspace\\P${index + 1}`,
+        {
+          goalSummary: `摘要 ${index + 1}`,
+          goalSummaryStatus: 'ready'
+        }
+      )
+    ),
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_card_1',
+        takeoverPickerTaskIds: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'],
+        takeoverPickerPage: 0,
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  let scanCalls = 0;
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => {
+      scanCalls += 1;
+      return { ok: true, sessions: [] };
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'takeover_picker_next_page', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(scanCalls, 0);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerPage, 1);
+  assert.match(cardText, /第 2 \/ 2 页/);
+  assert.match(cardText, /T6/);
+  assert.match(cardText, /T7/);
+  assert.doesNotMatch(cardText, /T1/);
+});
+
+test('takeover picker previous page does not rescan', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 8,
+    records: Array.from({ length: 7 }, (_, index) =>
+      createPersistedCodingRecord(
+        `T${index + 1}` as `T${number}`,
+        `thread-${index + 1}`,
+        `D:\\Workspace\\P${index + 1}`,
+        {
+          goalSummary: `摘要 ${index + 1}`,
+          goalSummaryStatus: 'ready'
+        }
+      )
+    ),
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_card_1',
+        takeoverPickerTaskIds: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'],
+        takeoverPickerPage: 1,
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  let scanCalls = 0;
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => {
+      scanCalls += 1;
+      return { ok: true, sessions: [] };
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'takeover_picker_prev_page', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(scanCalls, 0);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerPage, 0);
+  assert.match(cardText, /第 1 \/ 2 页/);
+  assert.match(cardText, /T1/);
+  assert.match(cardText, /T5/);
+  assert.doesNotMatch(cardText, /T6/);
+});
+
+test('refresh takeover picker rescans, resets to page one, and clears selected task', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 7,
+    records: Array.from({ length: 6 }, (_, index) =>
+      createPersistedCodingRecord(
+        `T${index + 1}` as `T${number}`,
+        `thread-${index + 1}`,
+        `D:\\Workspace\\P${index + 1}`,
+        {
+          goalSummary: `摘要 ${index + 1}`,
+          goalSummaryStatus: 'ready'
+        }
+      )
+    ),
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_card_1',
+        takeoverPickerTaskIds: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6'],
+        takeoverPickerPage: 1,
+        takeoverPickerSelectedTaskId: 'T6',
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  let scanCalls = 0;
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => {
+      scanCalls += 1;
+      return {
+        ok: true,
+        sessions: [
+          { threadId: 'thread-2', threadName: '刷新后任务 2', cwd: 'D:\\Workspace\\P2', updatedAt: '2026-04-21T09:00:00.000Z' },
+          { threadId: 'thread-1', threadName: '刷新后任务 1', cwd: 'D:\\Workspace\\P1', updatedAt: '2026-04-21T08:00:00.000Z' }
+        ]
+      };
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'refresh_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(scanCalls, 1);
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T2', 'T1']);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerPage, 0);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerSelectedTaskId, undefined);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerError, undefined);
+  assert.match(cardText, /第 1 \/ 1 页/);
+  assert.match(cardText, /T2/);
+  assert.match(cardText, /T1/);
+  assert.doesNotMatch(cardText, /已选中：T6/);
+});
+
+test('refresh takeover picker updates recent activity labels from the latest scan timestamps', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 2,
+    records: [
+      createPersistedCodingRecord('T1', 'thread-1', 'D:\\Workspace\\P1', {
+        goalSummary: '旧摘要 1',
+        goalSummaryStatus: 'ready',
+        lastEventAt: new Date(Date.now() - 5 * 60 * 60_000).toISOString()
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_card_1',
+        takeoverPickerTaskIds: ['T1'],
+        takeoverPickerPage: 0,
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  const recentUpdatedAt = new Date(Date.now() - 65_000).toISOString();
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: [
+        {
+          threadId: 'thread-1',
+          threadName: '刷新后的最近活动',
+          cwd: 'D:\\Workspace\\P1',
+          updatedAt: recentUpdatedAt
+        }
+      ]
+    }),
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'refresh_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(service.getTask('T1')?.lastEventAt, recentUpdatedAt);
+  assert.match(cardText, /最近活动：1 分钟前/);
+  assert.doesNotMatch(cardText, /最近活动：5 小时前/);
+});
+
+test('refresh takeover picker shows error state instead of empty state when scan fails', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 3,
+    records: [
+      createPersistedCodingRecord('T1', 'thread-1', 'D:\\Workspace\\P1', {
+        goalSummary: '旧摘要 1',
+        goalSummaryStatus: 'ready'
+      }),
+      createPersistedCodingRecord('T2', 'thread-2', 'D:\\Workspace\\P2', {
+        goalSummary: '旧摘要 2',
+        goalSummaryStatus: 'ready'
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_card_1',
+        takeoverPickerTaskIds: ['T1', 'T2'],
+        takeoverPickerPage: 0,
+        takeoverPickerSelectedTaskId: 'T2',
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  let scanCalls = 0;
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => {
+      scanCalls += 1;
+      return {
+        ok: false,
+        error: '扫描本地 Codex 失败：synthetic scan failure'
+      };
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'refresh_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(scanCalls, 1);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'takeover_picker');
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T1', 'T2']);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerSelectedTaskId, undefined);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerError, '扫描本地 Codex 失败：synthetic scan failure');
+  assert.match(cardText, /错误：扫描本地 Codex 失败：synthetic scan failure/);
+  assert.match(cardText, /T1/);
+  assert.match(cardText, /T2/);
+  assert.doesNotMatch(cardText, /当前没有可接管的本地 Codex Coding 会话/);
+});
+
+test('refresh takeover picker keeps the current page tasks aligned when scan fails on a later page', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 8,
+    records: [
+      createPersistedCodingRecord('T6', 'thread-6', 'D:\\Workspace\\P6', {
+        goalSummary: '摘要 6',
+        goalSummaryStatus: 'ready'
+      }),
+      createPersistedCodingRecord('T7', 'thread-7', 'D:\\Workspace\\P7', {
+        goalSummary: '摘要 7',
+        goalSummaryStatus: 'ready'
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_card_1',
+        takeoverPickerTaskIds: ['T6', 'T7'],
+        takeoverPickerPage: 1,
+        takeoverPickerTotalPages: 2,
+        takeoverPickerSelectedTaskId: 'T7',
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => ({
+      ok: false,
+      error: '扫描本地 Codex 失败：synthetic page-two scan failure'
+    }),
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'refresh_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerPage, 1);
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T6', 'T7']);
+  assert.equal((registry.getThreadUiState('feishu:chat-1') as any)?.takeoverPickerTotalPages, 2);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerSelectedTaskId, undefined);
+  assert.equal(
+    registry.getThreadUiState('feishu:chat-1')?.takeoverPickerError,
+    '扫描本地 Codex 失败：synthetic page-two scan failure'
+  );
+  assert.match(cardText, /错误：扫描本地 Codex 失败：synthetic page-two scan failure/);
+  assert.match(cardText, /第 2 \/ 2 页/);
+  assert.match(cardText, /T6/);
+  assert.match(cardText, /T7/);
+});
+
+test('open takeover picker shows error state when cliScannerResult throws', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => {
+      throw new Error('synthetic thrown failure');
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'takeover_picker');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerPage, 0);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerSelectedTaskId, undefined);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerError, '扫描本地 Codex 失败：synthetic thrown failure');
+  assert.match(cardText, /错误：扫描本地 Codex 失败：synthetic thrown failure/);
+});
+
+test('project card keyword preserves takeover picker view when the current card has a persisted snapshot', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 3,
+    records: [
+      createPersistedCodingRecord('T1', 'thread-1', 'D:\\Workspace\\P1', {
+        goalSummary: '摘要 1',
+        goalSummaryStatus: 'ready'
+      }),
+      createPersistedCodingRecord('T2', 'thread-2', 'D:\\Workspace\\P2', {
+        goalSummary: '摘要 2',
+        goalSummaryStatus: 'ready'
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_takeover_old_1',
+        takeoverPickerTaskIds: ['T1', 'T2'],
+        takeoverPickerPage: 0,
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession({ lifecycle: 'IDLE', codexThreadId: 'assistant-thread-1' }),
+    sendCardImpl: async (_threadId, card) => {
+      cards.push({ kind: 'send', card });
+      return 'om_takeover_copy_1';
+    }
+  });
+
+  await service.handleInboundMessage({ threadId: 'feishu:chat-1', text: '项目卡' });
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.match(cardText, /本地 Codex 接管/);
+  assert.match(cardText, /T1/);
+  assert.match(cardText, /T2/);
+  assert.doesNotMatch(cardText, /查询任务进展/);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'takeover_picker');
+});
+
+test('project card takeover picker clamps stale page and hides stale selection after persisted snapshot shrinks', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 7,
+    records: [
+      createPersistedCodingRecord('T1', 'thread-1', 'D:\\Workspace\\P1', {
+        goalSummary: '摘要 1',
+        goalSummaryStatus: 'ready'
+      }),
+      createPersistedCodingRecord('T2', 'thread-2', 'D:\\Workspace\\P2', {
+        goalSummary: '摘要 2',
+        goalSummaryStatus: 'ready'
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_takeover_old_2',
+        takeoverPickerTaskIds: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6'],
+        takeoverPickerPage: 4,
+        takeoverPickerSelectedTaskId: 'T6',
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:02'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession({ lifecycle: 'IDLE', codexThreadId: 'assistant-thread-1' }),
+    sendCardImpl: async (_threadId, card) => {
+      cards.push({ kind: 'send', card });
+      return 'om_takeover_copy_2';
+    }
+  });
+
+  await service.handleInboundMessage({ threadId: 'feishu:chat-1', text: '项目卡' });
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.match(cardText, /本地 Codex 接管/);
+  assert.match(cardText, /当前页：第 1 \/ 1 页/);
+  assert.match(cardText, /T1/);
+  assert.match(cardText, /T2/);
+  assert.doesNotMatch(cardText, /已选中：T6/);
+  assert.doesNotMatch(cardText, /T3/);
+  assert.doesNotMatch(cardText, /T4/);
+  assert.doesNotMatch(cardText, /T5/);
+  assert.doesNotMatch(cardText, /T6/);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'takeover_picker');
+});
+
+test('project card hides a stale takeover snapshot when another Feishu thread hot-manages the only candidate', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const hotSession = createMockSession({
+    lifecycle: 'RUNNING_TURN',
+    codexThreadId: 'shared-thread'
+  });
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    codingSessionFactory: (sessionOptions) => {
+      hotSession.setSnapshot({ taskId: String(sessionOptions.taskId ?? 'T2') } as any);
+      return hotSession;
+    },
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: [
+        {
+          threadId: 'shared-thread',
+          threadName: '项目卡旧候选',
+          cwd: 'D:\\Workspace\\Shared',
+          updatedAt: '2026-04-21T09:00:00.000Z'
+        }
+      ]
+    }),
+    sendCardImpl: async (_threadId, card) => {
+      cards.push({ kind: 'send', card });
+      return 'om_project_card_after_hot';
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+  await service.handleInboundMessage({ threadId: 'feishu:chat-2', text: '帮我在 D:\\Workspace\\Shared 下开一个 codex 窗口' });
+  await service.handleInboundMessage({ threadId: 'feishu:chat-1', text: '项目卡' });
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'status');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, undefined);
+  assert.doesNotMatch(cardText, /本地 Codex 接管/);
+  assert.doesNotMatch(cardText, /项目卡旧候选/);
+});
+
+test('confirm takeover task can successfully resume an imported placeholder selected from the picker', async () => {
+  const cards: Array<{ messageId: string; card: Record<string, unknown> }> = [];
+  const sent: string[] = [];
+  const resumedSession = createMockSession({
+    lifecycle: 'IDLE',
+    codexThreadId: 'placeholder-thread',
+    logPath: 'D:\\Workspace\\Placeholder\\logs\\communicate\\T1.log'
+  });
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1',
+      }
+    ]
+  });
+  let scanCalls = 0;
+  const { service } = createTestService({
+    sent,
+    registry,
+    session: resumedSession,
+    cliScannerResult: () => {
+      scanCalls += 1;
+      return {
+        ok: true,
+        sessions: [
+          {
+            threadId: 'placeholder-thread',
+            threadName: '占位任务摘要',
+            cwd: 'D:\\Workspace\\Placeholder',
+            updatedAt: '2026-04-21T09:00:00.000Z'
+          }
+        ]
+      };
+    },
+    cliProcess: {
+      list: () => [],
+      kill: () => ({ killed: 0, failed: 0, errors: [] })
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+  await service.handleCardAction({
+    threadId: 'feishu:chat-1',
+    kind: 'pick_takeover_task',
+    taskId: 'T1',
+    messageId: 'om_card_1'
+  } as any);
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'confirm_takeover_task', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(scanCalls, 1);
+  assert.equal(resumedSession.started, true);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.displayMode, 'coding');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.currentCodingTaskId, 'T1');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'status');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, undefined);
+  assert.match(sent[sent.length - 1] ?? '', /已开始接管 T1/);
+  assert.match(cardText, /当前: Coding/);
+  assert.doesNotMatch(cardText, /本地 Codex 接管/);
+});
+
+test('stale takeover confirm action does not resume a newer server-side selection', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const sent: string[] = [];
+  const resumedSession = createMockSession({
+    lifecycle: 'IDLE',
+    codexThreadId: 'placeholder-thread',
+    logPath: 'D:\\Workspace\\Placeholder\\logs\\communicate\\T1.log'
+  });
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMessageId: 'om_card_current_1',
+        statusCardActionMessageId: 'om_action_current_1'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent,
+    registry,
+    session: resumedSession,
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: [
+        {
+          threadId: 'placeholder-thread',
+          threadName: '占位任务摘要',
+          cwd: 'D:\\Workspace\\Placeholder',
+          updatedAt: '2026-04-21T09:00:00.000Z'
+        }
+      ]
+    }),
+    cliProcess: {
+      list: () => [],
+      kill: () => ({ killed: 0, failed: 0, errors: [] })
+    },
+    sendCardImpl: async (_threadId, card) => {
+      cards.push({ kind: 'send', card });
+      return 'om_card_fresh_after_stale';
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({
+    threadId: 'feishu:chat-1',
+    kind: 'open_takeover_picker',
+    messageId: 'om_action_current_1'
+  } as any);
+  await service.handleCardAction({
+    threadId: 'feishu:chat-1',
+    kind: 'pick_takeover_task',
+    taskId: 'T1',
+    messageId: 'om_action_current_1'
+  } as any);
+  await service.handleCardAction({
+    threadId: 'feishu:chat-1',
+    kind: 'confirm_takeover_task',
+    messageId: 'om_action_stale_1'
+  } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(resumedSession.started, false);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'takeover_picker');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.currentCodingTaskId, undefined);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMessageId, 'om_card_fresh_after_stale');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardActionMessageId, undefined);
+  assert.match(sent.at(-1) ?? '', /该接管卡已更新，请使用最新卡片操作。/);
+  assert.equal(cards.at(-1)?.kind, 'send');
+  assert.match(cardText, /本地 Codex 接管/);
+  assert.match(cardText, /T1/);
+});
+
+test('stale takeover confirm is rejected even before the fresh card binds a new action alias', async () => {
+  const cards: Array<{ kind: 'send' | 'update'; messageId?: string; card: Record<string, unknown> }> = [];
+  const sent: string[] = [];
+  const resumedSession = createMockSession({
+    lifecycle: 'IDLE',
+    codexThreadId: 'persisted-thread-1',
+    logPath: 'D:\\Workspace\\Persisted\\logs\\communicate\\T1.log'
+  });
+  const registry = createMockRegistry({
+    nextTaskId: 2,
+    records: [
+      createPersistedCodingRecord('T1', 'persisted-thread-1', 'D:\\Workspace\\Persisted', {
+        goalSummary: '持久化候选',
+        goalSummaryStatus: 'ready'
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_card_fresh_current',
+        statusCardActionMessageId: undefined,
+        takeoverPickerTaskIds: ['T1'],
+        takeoverPickerPage: 0,
+        takeoverPickerTotalPages: 1,
+        takeoverPickerSelectedTaskId: 'T1',
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent,
+    registry,
+    session: resumedSession,
+    cliProcess: {
+      list: () => [],
+      kill: () => ({ killed: 0, failed: 0, errors: [] })
+    },
+    sendCardImpl: async (_threadId, card) => {
+      cards.push({ kind: 'send', card });
+      return 'om_card_fresh_after_alias_guard';
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ kind: 'update', messageId, card });
+    }
+  });
+
+  await service.handleCardAction({
+    threadId: 'feishu:chat-1',
+    kind: 'confirm_takeover_task',
+    messageId: 'om_card_old_stale'
+  } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(resumedSession.started, false);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'takeover_picker');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.currentCodingTaskId, undefined);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMessageId, 'om_card_fresh_after_alias_guard');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardActionMessageId, undefined);
+  assert.match(sent.at(-1) ?? '', /该接管卡已更新，请使用最新卡片操作。/);
+  assert.equal(cards.at(-1)?.kind, 'send');
+  assert.match(cardText, /本地 Codex 接管/);
+  assert.match(cardText, /T1/);
+});
+
+test('confirm takeover task rejects a stale selection that is no longer in the current snapshot', async () => {
+  const cards: Array<{ messageId: string; card: Record<string, unknown> }> = [];
+  const resumedSession = createMockSession({
+    lifecycle: 'IDLE',
+    codexThreadId: 'thread-2'
+  });
+  const registry = createMockRegistry({
+    nextTaskId: 3,
+    records: [
+      createPersistedCodingRecord('T1', 'thread-1', 'D:\\Workspace\\P1', {
+        goalSummary: '候选 1',
+        goalSummaryStatus: 'ready'
+      }),
+      createPersistedCodingRecord('T2', 'thread-2', 'D:\\Workspace\\P2', {
+        goalSummary: '候选 2',
+        goalSummaryStatus: 'ready'
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_card_1',
+        takeoverPickerTaskIds: ['T1'],
+        takeoverPickerPage: 0,
+        takeoverPickerSelectedTaskId: 'T2',
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: resumedSession,
+    cliProcess: {
+      list: () => [],
+      kill: () => ({ killed: 0, failed: 0, errors: [] })
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'confirm_takeover_task', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(resumedSession.started, false);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'takeover_picker');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerSelectedTaskId, undefined);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerError, '当前选择已失效，请刷新后重试。');
+  assert.match(cardText, /错误：当前选择已失效，请刷新后重试。/);
+});
+
+test('confirm takeover task rejects a placeholder once another Feishu thread hot-manages the same Codex session', async () => {
+  const cards: Array<{ messageId: string; card: Record<string, unknown> }> = [];
+  const sent: string[] = [];
+  const hotSession = createMockSession({
+    lifecycle: 'RUNNING_TURN',
+    codexThreadId: 'shared-thread'
+  });
+  const unexpectedResumeSession = createMockSession({
+    lifecycle: 'IDLE',
+    codexThreadId: 'shared-thread'
+  });
+  const codingSessionFactoryCalls: Array<Record<string, unknown>> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent,
+    registry,
+    codingSessionFactory: (sessionOptions) => {
+      codingSessionFactoryCalls.push({ ...sessionOptions });
+      const session = codingSessionFactoryCalls.length === 1 ? hotSession : unexpectedResumeSession;
+      session.setSnapshot({ taskId: String(sessionOptions.taskId ?? `T${codingSessionFactoryCalls.length}`) } as any);
+      return session;
+    },
+    cliScannerResult: () => ({
+      ok: true,
+      sessions: [
+        {
+          threadId: 'shared-thread',
+          threadName: '会被其他线程接管的候选任务',
+          cwd: 'D:\\Workspace\\Shared',
+          updatedAt: '2026-04-21T09:00:00.000Z'
+        }
+      ]
+    }),
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+  await service.handleCardAction({
+    threadId: 'feishu:chat-1',
+    kind: 'pick_takeover_task',
+    taskId: 'T1',
+    messageId: 'om_card_1'
+  } as any);
+  await service.handleInboundMessage({ threadId: 'feishu:chat-2', text: '帮我在 D:\\Workspace\\Shared 下开一个 codex 窗口' });
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'confirm_takeover_task', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(codingSessionFactoryCalls.length, 1);
+  assert.equal(unexpectedResumeSession.started, false);
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'takeover_picker');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerSelectedTaskId, undefined);
+  assert.equal(
+    registry.getThreadUiState('feishu:chat-1')?.takeoverPickerError,
+    '任务 T1 对应的本地 Codex 会话已被其它飞书线程接管，请刷新后重试。'
+  );
+  assert.match(cardText, /错误：任务 T1 对应的本地 Codex 会话已被其它飞书线程接管，请刷新后重试。/);
+  assert.doesNotMatch(cardText, /会被其他线程接管的候选任务/);
+});
+
+test('refresh takeover picker clears stale imported placeholders that are no longer in snapshot', async () => {
+  const cards: Array<{ messageId: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 1,
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        statusCardMode: 'status',
+        statusCardMessageId: 'om_card_1',
+      }
+    ]
+  });
+  let scanCalls = 0;
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    cliScannerResult: () => {
+      scanCalls += 1;
+      if (scanCalls === 1) {
+        return {
+          ok: true,
+          sessions: [
+            {
+              threadId: 'placeholder-thread-1',
+              threadName: '旧候选',
+              cwd: 'D:\\Workspace\\Placeholder1',
+              updatedAt: '2026-04-21T08:00:00.000Z'
+            },
+            {
+              threadId: 'placeholder-thread-2',
+              threadName: '仍然存在的候选',
+              cwd: 'D:\\Workspace\\Placeholder2',
+              updatedAt: '2026-04-21T09:00:00.000Z'
+            }
+          ]
+        };
+      }
+      return {
+        ok: true,
+        sessions: [
+          {
+            threadId: 'placeholder-thread-2',
+            threadName: '仍然存在的候选',
+            cwd: 'D:\\Workspace\\Placeholder2',
+            updatedAt: '2026-04-21T09:00:00.000Z'
+          }
+        ]
+      };
+    },
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'open_takeover_picker', messageId: 'om_card_1' } as any);
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'refresh_takeover_picker', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(scanCalls, 2);
+  assert.equal(service.getTask('T1'), undefined);
+  assert.equal(registry.getSessionRecord('T1'), undefined);
+  assert.equal(service.getTask('T2')?.id, 'T2');
+  assert.deepEqual(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, ['T2']);
+  assert.match(cardText, /T2/);
+  assert.doesNotMatch(cardText, /T1/);
+});
+
+test('return_to_status clears unconfirmed imported placeholders but keeps current coding task', async () => {
+  const cards: Array<{ messageId: string; card: Record<string, unknown> }> = [];
+  const registry = createMockRegistry({
+    nextTaskId: 3,
+    records: [
+      createImportedTakeoverPlaceholderRecord('T1', 'placeholder-thread-1', 'D:\\Workspace\\Placeholder1'),
+      createPersistedCodingRecord('T2', 'coding-thread-2', 'D:\\Workspace\\Current', {
+        goalSummary: '当前保留任务',
+        goalSummaryStatus: 'ready'
+      })
+    ],
+    threadUiStates: [
+      {
+        feishuThreadId: 'feishu:chat-1',
+        displayMode: 'assistant',
+        currentCodingTaskId: 'T2',
+        statusCardMode: 'takeover_picker',
+        statusCardMessageId: 'om_card_1',
+        takeoverPickerTaskIds: ['T1'],
+        takeoverPickerPage: 0,
+        takeoverPickerSelectedTaskId: 'T1',
+        takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+      }
+    ]
+  });
+  const { service } = createTestService({
+    sent: [],
+    registry,
+    session: createMockSession(),
+    updateCardImpl: async (messageId, card) => {
+      cards.push({ messageId, card });
+    }
+  });
+
+  await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'return_to_status', messageId: 'om_card_1' } as any);
+
+  const cardText = collectCardTextContents(cards.at(-1)?.card ?? {}).join('\n');
+  assert.equal(service.getTask('T1'), undefined);
+  assert.equal(registry.getSessionRecord('T1'), undefined);
+  assert.equal(service.getTask('T2')?.id, 'T2');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.statusCardMode, 'status');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.currentCodingTaskId, 'T2');
+  assert.equal(registry.getThreadUiState('feishu:chat-1')?.takeoverPickerTaskIds, undefined);
+  assert.doesNotMatch(cardText, /本地 Codex 接管/);
+});
+
 test('restart reuses Tn after discarding an unused recovered empty coding task', async () => {
   const logs = createTempLogFixture();
   try {
@@ -5567,6 +7172,94 @@ test('pick current task resumes a recoverable failed persisted coding task befor
     assert.equal(registry.getThreadUiState('feishu:chat-1')?.currentCodingTaskId, 'T1');
     assert.deepEqual(resumedSession.replies.at(-1), { action: 'free_text', text: '继续修复失败恢复' });
     assert.equal(assistantSession.replies.length, 0);
+  } finally {
+    logs.cleanup();
+  }
+});
+
+test('pick current task rejects a recoverable coding task once another Feishu thread hot-manages the same Codex session', async () => {
+  const sent: string[] = [];
+  const logs = createTempLogFixture();
+  const hotSession = createMockSession({ lifecycle: 'RUNNING_TURN', codexThreadId: 'shared-thread' });
+  const codingSessionFactoryCalls: Array<Record<string, unknown>> = [];
+  try {
+    const registry = createMockRegistry({
+      nextTaskId: 2,
+      records: [
+        createPersistedCodingRecord('T1', 'shared-thread', 'D:\\Workspace\\Shared', {
+          feishuThreadId: 'feishu:chat-1',
+          logPath: logs.writeLog('T1', '[2026-03-26T00:00:05.000Z] FEISHU IN 继续之前的共享修复任务\n')
+        })
+      ],
+      threadUiStates: [
+        {
+          feishuThreadId: 'feishu:chat-1',
+          displayMode: 'assistant'
+        }
+      ]
+    });
+    const { service } = createTestService({
+      sent,
+      registry,
+      codingSessionFactory: (sessionOptions) => {
+        codingSessionFactoryCalls.push({ ...sessionOptions });
+        hotSession.setSnapshot({ taskId: String(sessionOptions.taskId ?? 'T2') } as any);
+        return hotSession;
+      },
+      assistantSessionFactory: () => createMockSession({ lifecycle: 'IDLE', codexThreadId: 'assistant-thread-1' })
+    });
+
+    await service.handleInboundMessage({ threadId: 'feishu:chat-2', text: '帮我在 D:\\Workspace\\Shared 下开一个 codex 窗口' });
+    await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'pick_current_task', taskId: 'T1', messageId: 'om_card_1' } as any);
+
+    assert.equal(codingSessionFactoryCalls.length, 1);
+    assert.equal(registry.getThreadUiState('feishu:chat-1')?.displayMode, 'assistant');
+    assert.equal(registry.getThreadUiState('feishu:chat-1')?.currentCodingTaskId, undefined);
+    assert.match(sent.at(-1) ?? '', /任务 T1 对应的本地 Codex 会话已被其它飞书线程接管，请刷新后重试。 已保持助手模式。/);
+  } finally {
+    logs.cleanup();
+  }
+});
+
+test('pick current task reports the current-thread hot owner when another task in the same thread already manages the Codex session', async () => {
+  const sent: string[] = [];
+  const logs = createTempLogFixture();
+  const hotSession = createMockSession({ lifecycle: 'RUNNING_TURN', codexThreadId: 'shared-thread' });
+  const codingSessionFactoryCalls: Array<Record<string, unknown>> = [];
+  try {
+    const registry = createMockRegistry({
+      nextTaskId: 2,
+      records: [
+        createPersistedCodingRecord('T1', 'shared-thread', 'D:\\Workspace\\Shared', {
+          feishuThreadId: 'feishu:chat-1',
+          logPath: logs.writeLog('T1', '[2026-03-26T00:00:05.000Z] FEISHU IN 继续之前的共享修复任务\n')
+        })
+      ],
+      threadUiStates: [
+        {
+          feishuThreadId: 'feishu:chat-1',
+          displayMode: 'assistant'
+        }
+      ]
+    });
+    const { service } = createTestService({
+      sent,
+      registry,
+      codingSessionFactory: (sessionOptions) => {
+        codingSessionFactoryCalls.push({ ...sessionOptions });
+        hotSession.setSnapshot({ taskId: String(sessionOptions.taskId ?? 'T2') } as any);
+        return hotSession;
+      },
+      assistantSessionFactory: () => createMockSession({ lifecycle: 'IDLE', codexThreadId: 'assistant-thread-1' })
+    });
+
+    await service.handleInboundMessage({ threadId: 'feishu:chat-1', text: '帮我在 D:\\Workspace\\Shared 下开一个 codex 窗口' });
+    await service.handleCardAction({ threadId: 'feishu:chat-1', kind: 'pick_current_task', taskId: 'T1', messageId: 'om_card_1' } as any);
+
+    assert.equal(codingSessionFactoryCalls.length, 1);
+    assert.equal(registry.getThreadUiState('feishu:chat-1')?.displayMode, 'assistant');
+    assert.equal(registry.getThreadUiState('feishu:chat-1')?.currentCodingTaskId, undefined);
+    assert.match(sent.at(-1) ?? '', /任务 T1 对应的本地 Codex 会话已被当前线程中的 T2 接管，请刷新后重试。 已保持助手模式。/);
   } finally {
     logs.cleanup();
   }
@@ -8215,6 +9908,58 @@ test('takeover by task id kills a uniquely matched process and resumes', async (
   assert.equal(factoryOptions?.mode, 'resume');
   assert.equal(factoryOptions?.resumeThreadId, 'codex-thread-99');
   assert.match(sent[sent.length - 1] ?? '', /已开始接管 T1/);
+});
+
+test('takeover by task id rejects a stale placeholder once another Feishu thread hot-manages the same Codex session', async () => {
+  const sent: string[] = [];
+  const hotSession = createMockSession({
+    lifecycle: 'RUNNING_TURN',
+    codexThreadId: 'shared-thread'
+  });
+  const unexpectedResumeSession = createMockSession({
+    lifecycle: 'IDLE',
+    codexThreadId: 'shared-thread'
+  });
+  const codingSessionFactoryCalls: Array<Record<string, unknown>> = [];
+  let killed: Array<any> = [];
+  let scanCalls = 0;
+  const { service } = createTestService({
+    sent,
+    codingSessionFactory: (sessionOptions) => {
+      codingSessionFactoryCalls.push({ ...sessionOptions });
+      const session = codingSessionFactoryCalls.length === 1 ? hotSession : unexpectedResumeSession;
+      session.setSnapshot({ taskId: String(sessionOptions.taskId ?? `T${codingSessionFactoryCalls.length}`) } as any);
+      return session;
+    },
+    cliScanner: () => {
+      scanCalls += 1;
+      return [
+        {
+          threadId: 'shared-thread',
+          updatedAt: '2026-04-21T09:00:00.000Z',
+          cwd: 'D:\\Workspace\\Shared',
+          firstText: '旧占位任务摘要'
+        }
+      ];
+    },
+    cliProcess: {
+      list: () => [{ pid: 11, commandLine: 'codex run --thread shared-thread' }],
+      kill: (processes: Array<any>) => {
+        killed = processes;
+        return { killed: processes.length, failed: 0, errors: [] };
+      }
+    }
+  });
+
+  await service.handleInboundMessage({ threadId: 'feishu:chat-1', text: '接管 codex' });
+  await service.handleInboundMessage({ threadId: 'feishu:chat-2', text: '帮我在 D:\\Workspace\\Shared 下开一个 codex 窗口' });
+  await service.handleInboundMessage({ threadId: 'feishu:chat-1', text: '接管T1' });
+
+  assert.equal(scanCalls, 2);
+  assert.equal(codingSessionFactoryCalls.length, 1);
+  assert.equal(unexpectedResumeSession.started, false);
+  assert.equal(killed.length, 0);
+  assert.match(sent[sent.length - 1] ?? '', /任务 T1 对应的本地 Codex 会话已被其它飞书线程接管，请刷新后重试。/);
 });
 
 test('debug diagnostics log recovered-thread conflicts and resume caller metadata', async () => {

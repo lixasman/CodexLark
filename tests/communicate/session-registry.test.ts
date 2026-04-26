@@ -636,6 +636,272 @@ test('session registry persists launcher status card mode across reloads', () =>
   }
 });
 
+test('session registry persists takeover picker thread ui fields', () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-session-registry-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+
+  try {
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+
+    registry.upsertThreadUiState({
+      feishuThreadId: 'feishu:chat-takeover-1',
+      displayMode: 'coding',
+      statusCardMode: 'takeover_picker',
+      currentCodingTaskId: 'T9',
+      takeoverPickerTaskIds: ['T4', 'T9', 'T11'],
+      takeoverPickerPage: 1,
+      takeoverPickerSelectedTaskId: 'T9',
+      takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01',
+      takeoverPickerError: '请先选择一个本地 Codex 任务'
+    });
+
+    const reloaded = createSessionRegistry({ registryPath });
+    assert.deepEqual(reloaded.getThreadUiState('feishu:chat-takeover-1'), {
+      feishuThreadId: 'feishu:chat-takeover-1',
+      displayMode: 'coding',
+      statusCardMode: 'takeover_picker',
+      currentCodingTaskId: 'T9',
+      takeoverPickerTaskIds: ['T4', 'T9', 'T11'],
+      takeoverPickerPage: 1,
+      takeoverPickerSelectedTaskId: 'T9',
+      takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01',
+      takeoverPickerError: '请先选择一个本地 Codex 任务'
+    });
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('session registry drops invalid takeover picker fields during reload', () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-session-registry-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+
+  try {
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        nextTaskId: 2,
+        sessions: {},
+        threadBindings: {},
+        threadUiStates: {
+          'feishu:chat-invalid-takeover': {
+            feishuThreadId: 'feishu:chat-invalid-takeover',
+            displayMode: 'coding',
+            statusCardMode: 'bad-mode',
+            currentCodingTaskId: 'T3',
+            takeoverPickerTaskIds: ['T8', 'T8', '', 'bad-id', 'T11', 'T11'],
+            takeoverPickerPage: -1,
+            takeoverPickerSelectedTaskId: 'not-a-task',
+            takeoverPickerSnapshotUpdatedAt: '   2026-04-21 10:01   ',
+            takeoverPickerError: '   请先选择一个任务   '
+          }
+        },
+        inboundMessages: {},
+        recentProjectDirs: []
+      }, null, 2),
+      'utf8'
+    );
+
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+
+    assert.deepEqual(registry.getThreadUiState('feishu:chat-invalid-takeover'), {
+      feishuThreadId: 'feishu:chat-invalid-takeover',
+      displayMode: 'coding',
+      currentCodingTaskId: 'T3',
+      takeoverPickerTaskIds: ['T8', 'T11'],
+      takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01',
+      takeoverPickerError: '请先选择一个任务'
+    });
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('session registry dedupes takeover picker task ids for valid takeover picker records', () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-session-registry-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+
+  try {
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        nextTaskId: 12,
+        sessions: {},
+        threadBindings: {},
+        threadUiStates: {
+          'feishu:chat-valid-takeover': {
+            feishuThreadId: 'feishu:chat-valid-takeover',
+            displayMode: 'coding',
+            statusCardMode: 'takeover_picker',
+            currentCodingTaskId: 'T9',
+            takeoverPickerTaskIds: ['T9', 'T9', 'T11', 'T11'],
+            takeoverPickerPage: 0,
+            takeoverPickerSelectedTaskId: 'T11',
+            takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+          }
+        },
+        inboundMessages: {},
+        recentProjectDirs: []
+      }, null, 2),
+      'utf8'
+    );
+
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+
+    assert.deepEqual(registry.getThreadUiState('feishu:chat-valid-takeover'), {
+      feishuThreadId: 'feishu:chat-valid-takeover',
+      displayMode: 'coding',
+      statusCardMode: 'takeover_picker',
+      currentCodingTaskId: 'T9',
+      takeoverPickerTaskIds: ['T9', 'T11'],
+      takeoverPickerPage: 0,
+      takeoverPickerSelectedTaskId: 'T11',
+      takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+    });
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('session registry preserves launcher and status fields when takeover picker fields are absent', () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-session-registry-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+
+  try {
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        nextTaskId: 4,
+        sessions: {},
+        threadBindings: {},
+        threadUiStates: {
+          'feishu:chat-launcher-1': {
+            feishuThreadId: 'feishu:chat-launcher-1',
+            displayMode: 'assistant',
+            statusCardMode: 'launcher',
+            statusCardMessageId: 'om_launcher_1',
+            launcherSelectedCwd: 'D:\\Workspace\\CodexLark',
+            launcherDraftCwd: 'D:\\Workspace\\CodexLark\\draft',
+            launcherError: '无法启动'
+          },
+          'feishu:chat-status-1': {
+            feishuThreadId: 'feishu:chat-status-1',
+            displayMode: 'coding',
+            statusCardMode: 'status',
+            currentCodingTaskId: 'T6',
+            statusCardMessageId: 'om_status_1',
+            statusCardActionMessageId: 'open_message_status_1',
+            statusCardPickerOpen: true
+          }
+        },
+        inboundMessages: {},
+        recentProjectDirs: []
+      }, null, 2),
+      'utf8'
+    );
+
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+
+    assert.deepEqual(registry.getThreadUiState('feishu:chat-launcher-1'), {
+      feishuThreadId: 'feishu:chat-launcher-1',
+      displayMode: 'assistant',
+      statusCardMode: 'launcher',
+      statusCardMessageId: 'om_launcher_1',
+      launcherSelectedCwd: 'D:\\Workspace\\CodexLark',
+      launcherDraftCwd: 'D:\\Workspace\\CodexLark\\draft',
+      launcherError: '无法启动'
+    });
+    assert.deepEqual(registry.getThreadUiState('feishu:chat-status-1'), {
+      feishuThreadId: 'feishu:chat-status-1',
+      displayMode: 'coding',
+      statusCardMode: 'status',
+      currentCodingTaskId: 'T6',
+      statusCardMessageId: 'om_status_1',
+      statusCardActionMessageId: 'open_message_status_1',
+      statusCardPickerOpen: true
+    });
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('session registry clears takeover picker fields when thread ui record is replaced without them', () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-session-registry-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+
+  try {
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+
+    registry.upsertThreadUiState({
+      feishuThreadId: 'feishu:chat-takeover-clear-1',
+      displayMode: 'coding',
+      statusCardMode: 'takeover_picker',
+      currentCodingTaskId: 'T5',
+      takeoverPickerTaskIds: ['T5', 'T7'],
+      takeoverPickerPage: 1,
+      takeoverPickerSelectedTaskId: 'T7',
+      takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01',
+      takeoverPickerError: '请先选择'
+    });
+    registry.upsertThreadUiState({
+      feishuThreadId: 'feishu:chat-takeover-clear-1',
+      displayMode: 'assistant',
+      statusCardMode: 'status',
+      takeoverPickerTaskIds: undefined,
+      takeoverPickerPage: undefined,
+      takeoverPickerSelectedTaskId: undefined,
+      takeoverPickerSnapshotUpdatedAt: undefined,
+      takeoverPickerError: undefined
+    });
+
+    const reloaded = createSessionRegistry({ registryPath });
+    assert.deepEqual(reloaded.getThreadUiState('feishu:chat-takeover-clear-1'), {
+      feishuThreadId: 'feishu:chat-takeover-clear-1',
+      displayMode: 'assistant',
+      statusCardMode: 'status',
+      currentCodingTaskId: 'T5'
+    });
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('session registry returns defensive copies of takeover picker task ids', () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-session-registry-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+
+  try {
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+
+    registry.upsertThreadUiState({
+      feishuThreadId: 'feishu:chat-takeover-copy-1',
+      displayMode: 'coding',
+      statusCardMode: 'takeover_picker',
+      takeoverPickerTaskIds: ['T2', 'T4']
+    });
+
+    const firstRead = registry.getThreadUiState('feishu:chat-takeover-copy-1') as {
+      takeoverPickerTaskIds?: string[];
+    };
+    firstRead.takeoverPickerTaskIds?.push('T99');
+
+    assert.deepEqual(registry.getThreadUiState('feishu:chat-takeover-copy-1'), {
+      feishuThreadId: 'feishu:chat-takeover-copy-1',
+      displayMode: 'coding',
+      statusCardMode: 'takeover_picker',
+      takeoverPickerTaskIds: ['T2', 'T4']
+    });
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('session registry preserves current coding target when thread mode switches to assistant', () => {
   const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-session-registry-'));
   const registryPath = path.join(rootDir, 'registry.json');

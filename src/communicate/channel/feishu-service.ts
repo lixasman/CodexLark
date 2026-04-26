@@ -8,7 +8,12 @@ import {
 import { segmentText } from '../delivery/segmenter';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { routeUserMessage } from '../control/router';
-import { scanCodexCliSessions, type CodexCliSessionInfo } from '../control/codex-cli-scan';
+import {
+  scanCodexCliSessions,
+  scanCodexCliSessionsResult,
+  type CodexCliScanResult,
+  type CodexCliSessionInfo
+} from '../control/codex-cli-scan';
 import { filterCodexCliProcesses, listCodexCliProcesses, terminateCodexCliProcesses, type CodexProcessInfo } from '../control/codex-cli-process';
 import { validateReplyCommand } from '../control/validator';
 import {
@@ -72,6 +77,8 @@ const DEFAULT_ASSISTANT_DEVELOPER_INSTRUCTIONS = `你是长期科研助理，你
 7. 不要输出空泛鼓励、套话、无信息安慰。`;
 
 const DEFAULT_TAKEOVER_LIST_LIMIT = 5;
+const TAKEOVER_PICKER_PAGE_SIZE = 5;
+const TAKEOVER_PICKER_SUMMARY_MAX_CHARS = 36;
 const DEFAULT_REPLY_STATUS_REFRESH_MS = 10_000;
 const DEFAULT_ASSISTANT_REPLY_RECEIPT_REFRESH_MS = 2_000;
 const DEFAULT_REPLY_STATUS_STALL_THRESHOLD_MS = 120_000;
@@ -326,6 +333,12 @@ type ReplyStatusScheduler = {
   clearInterval: (handle: unknown) => void;
 };
 
+type TakeoverPickerSnapshotRecord = {
+  sessions: CodexCliSessionInfo[];
+  snapshotUpdatedAt: string;
+  totalPages: number;
+};
+
 export type FeishuServiceWorkerEvent =
   | {
       type: 'task_waiting_user';
@@ -357,6 +370,7 @@ export function createFeishuService(input: {
   codingSessionFactory?: FeishuSessionFactory;
   polishRewrite?: (text: string) => Promise<string> | string;
   cliScanner?: () => CodexCliSessionInfo[];
+  cliScannerResult?: () => CodexCliScanResult;
   cliProcess?: {
     list: () => CodexProcessInfo[];
     kill: (processes: CodexProcessInfo[]) => { killed: number; failed: number; errors: string[] };
@@ -422,6 +436,7 @@ export function createFeishuService(input: {
   const recoveredTasks = new Map<`T${number}`, CommunicateTaskRecord>();
   const assistantBindings = new Map<string, `T${number}`>();
   const threadUiStates = new Map<string, SessionThreadUiStateRecord>();
+  const takeoverPickerSnapshots = new Map<string, TakeoverPickerSnapshotRecord>();
   const pendingAssistantThreads = new Map<string, Promise<void>>();
   const pendingClarifications = new Map<string, { kind: 'codex_cwd' }>();
   const pendingGoalSummaryJobs = new Map<`T${number}`, Promise<void>>();
@@ -514,6 +529,7 @@ export function createFeishuService(input: {
   if (FEISHU_DEBUG) {
     logRecoveredCodexThreadConflicts(recoveredSessionRecords);
   }
+  pruneRecoveredImportedTakeoverPlaceholderTasks();
   pruneRecoveredAbandonedEmptyCodingTasks();
 
   function summarizeRegistryCodexThreadOwners(
@@ -588,9 +604,21 @@ export function createFeishuService(input: {
     threadId: string,
     patch: Partial<Omit<SessionThreadUiStateRecord, 'feishuThreadId'>>
   ): SessionThreadUiStateRecord {
+    const normalizedPatch =
+      patch.statusCardMode && patch.statusCardMode !== 'takeover_picker'
+        ? {
+            ...patch,
+            takeoverPickerTaskIds: undefined,
+            takeoverPickerPage: undefined,
+            takeoverPickerTotalPages: undefined,
+            takeoverPickerSelectedTaskId: undefined,
+            takeoverPickerSnapshotUpdatedAt: undefined,
+            takeoverPickerError: undefined
+          }
+        : patch;
     const nextRecord: SessionThreadUiStateRecord = {
       ...getThreadUiState(threadId),
-      ...patch,
+      ...normalizedPatch,
       feishuThreadId: threadId
     };
     threadUiStates.set(threadId, nextRecord);
@@ -1790,8 +1818,11 @@ export function createFeishuService(input: {
     }
   }
 
-  function rememberStatusCardAction(threadId: string, action: Pick<FeishuCardActionEvent, 'kind' | 'messageId'>): void {
-    if (!action.messageId) return;
+  function rememberStatusCardAction(
+    threadId: string,
+    action: Pick<FeishuCardActionEvent, 'kind' | 'messageId'>
+  ): 'ignored' | 'bound' | 'matched' | 'mismatch' {
+    if (!action.messageId) return 'ignored';
     const currentUi = getThreadUiState(threadId);
     if (!currentUi.statusCardMessageId) {
       logFeishuDebug('status card action without tracked message id', {
@@ -1799,9 +1830,26 @@ export function createFeishuService(input: {
         kind: action.kind,
         actionMessageId: action.messageId
       });
-      return;
+      return 'ignored';
     }
     if (!currentUi.statusCardActionMessageId) {
+      if (
+        currentUi.statusCardMode === 'takeover_picker' &&
+        isTakeoverPickerStatusCardAction(action) &&
+        currentUi.statusCardMessageId !== action.messageId
+      ) {
+        setThreadUiState(threadId, {
+          statusCardMessageId: undefined,
+          statusCardActionMessageId: undefined
+        });
+        logFeishuDebug('takeover picker action message mismatch before alias bind; forcing fresh card send', {
+          threadId,
+          kind: action.kind,
+          trackedMessageId: currentUi.statusCardMessageId,
+          actionMessageId: action.messageId
+        });
+        return 'mismatch';
+      }
       setThreadUiState(threadId, { statusCardActionMessageId: action.messageId });
       logFeishuDebug('status card action alias bound', {
         threadId,
@@ -1809,7 +1857,7 @@ export function createFeishuService(input: {
         trackedMessageId: currentUi.statusCardMessageId,
         actionMessageId: action.messageId
       });
-      return;
+      return 'bound';
     }
     if (currentUi.statusCardActionMessageId !== action.messageId) {
       setThreadUiState(threadId, {
@@ -1823,7 +1871,7 @@ export function createFeishuService(input: {
         trackedActionMessageId: currentUi.statusCardActionMessageId,
         actionMessageId: action.messageId
       });
-      return;
+      return 'mismatch';
     }
     logFeishuDebug('status card action matched tracked alias', {
       threadId,
@@ -1831,6 +1879,18 @@ export function createFeishuService(input: {
       trackedMessageId: currentUi.statusCardMessageId,
       actionMessageId: action.messageId
     });
+    return 'matched';
+  }
+
+  function isTakeoverPickerStatusCardAction(action: Pick<FeishuCardActionEvent, 'kind'>): boolean {
+    return (
+      action.kind === 'takeover_picker_next_page' ||
+      action.kind === 'takeover_picker_prev_page' ||
+      action.kind === 'refresh_takeover_picker' ||
+      action.kind === 'pick_takeover_task' ||
+      action.kind === 'confirm_takeover_task' ||
+      action.kind === 'return_to_status'
+    );
   }
 
   function getRecentProjectDirs(): string[] {
@@ -2219,6 +2279,23 @@ export function createFeishuService(input: {
     return true;
   }
 
+  function isImportedTakeoverPlaceholderTask(
+    task: Pick<
+      CommunicateTaskRecord,
+      'taskType' | 'sessionKind' | 'startupMode' | 'logFilePath' | 'codexThreadId' | 'id'
+    > | undefined
+  ): task is CommunicateTaskRecord {
+    return Boolean(
+      task &&
+      task.taskType === 'codex_session' &&
+      task.sessionKind === 'coding' &&
+      task.startupMode === 'resume' &&
+      !sessions.has(task.id) &&
+      !(typeof task.logFilePath === 'string' && task.logFilePath.trim() !== '') &&
+      Boolean(task.codexThreadId)
+    );
+  }
+
   function isAbandonedEmptyCodingTask(
     task: CommunicateTaskRecord | undefined,
     source: 'live' | 'recovered' = 'live'
@@ -2258,6 +2335,72 @@ export function createFeishuService(input: {
     let discardedAny = false;
     for (const task of Array.from(recoveredTasks.values())) {
       if (!isAbandonedEmptyCodingTask(task, 'recovered')) continue;
+      finalizeDiscardedTask(task);
+      discardedAny = true;
+    }
+    if (discardedAny) {
+      sessionRegistry.recomputeNextTaskId();
+    }
+  }
+
+  function pruneRecoveredImportedTakeoverPlaceholderTasks(): void {
+    let discardedAny = false;
+    for (const task of Array.from(recoveredTasks.values())) {
+      if (!isImportedTakeoverPlaceholderTask(task)) continue;
+      finalizeDiscardedTask(task);
+      discardedAny = true;
+    }
+    if (discardedAny) {
+      sessionRegistry.recomputeNextTaskId();
+    }
+  }
+
+  function pruneImportedTakeoverPlaceholdersForThread(
+    threadId: string,
+    retainedTaskIds: Iterable<`T${number}`> = []
+  ): void {
+    const retained = new Set(retainedTaskIds);
+    const currentCodingTaskId = getThreadUiState(threadId).currentCodingTaskId;
+    let discardedAny = false;
+    for (const task of store.listTasksByThread(threadId)) {
+      if (!isImportedTakeoverPlaceholderTask(task)) continue;
+      if (retained.has(task.id) || currentCodingTaskId === task.id || sessions.has(task.id)) continue;
+      finalizeDiscardedTask(task);
+      discardedAny = true;
+    }
+    for (const task of Array.from(recoveredTasks.values())) {
+      if (task.threadId !== threadId || !isImportedTakeoverPlaceholderTask(task)) continue;
+      if (retained.has(task.id) || currentCodingTaskId === task.id || sessions.has(task.id)) continue;
+      finalizeDiscardedTask(task);
+      discardedAny = true;
+    }
+    if (discardedAny) {
+      sessionRegistry.recomputeNextTaskId();
+    }
+  }
+
+  function pruneImportedTakeoverPlaceholdersForThreadByCodexThreadIds(
+    threadId: string,
+    retainedCodexThreadIds: Iterable<string> = []
+  ): void {
+    const retained = new Set(
+      Array.from(retainedCodexThreadIds)
+        .map((codexThreadId) => codexThreadId.trim())
+        .filter(Boolean)
+    );
+    const currentCodingTaskId = getThreadUiState(threadId).currentCodingTaskId;
+    let discardedAny = false;
+    for (const task of store.listTasksByThread(threadId)) {
+      if (!isImportedTakeoverPlaceholderTask(task)) continue;
+      if (retained.has(task.codexThreadId ?? '')) continue;
+      if (currentCodingTaskId === task.id || sessions.has(task.id)) continue;
+      finalizeDiscardedTask(task);
+      discardedAny = true;
+    }
+    for (const task of Array.from(recoveredTasks.values())) {
+      if (task.threadId !== threadId || !isImportedTakeoverPlaceholderTask(task)) continue;
+      if (retained.has(task.codexThreadId ?? '')) continue;
+      if (currentCodingTaskId === task.id || sessions.has(task.id)) continue;
       finalizeDiscardedTask(task);
       discardedAny = true;
     }
@@ -2355,13 +2498,567 @@ export function createFeishuService(input: {
     }
   }
 
+  function formatTakeoverPickerSnapshotUpdatedAt(date: Date = new Date()): string {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    return `${year}-${month}-${day} ${hours}:${minutes}`;
+  }
+
+  function describeTakeoverScanError(error: string): string {
+    const trimmed = error.trim();
+    return trimmed.startsWith('扫描本地 Codex 失败：') ? trimmed : `扫描本地 Codex 失败：${trimmed}`;
+  }
+
+  function resolveTakeoverPickerTotalPagesForCount(taskCount: number): number {
+    return Math.max(1, Math.ceil(taskCount / TAKEOVER_PICKER_PAGE_SIZE));
+  }
+
+  function clampTakeoverPickerPage(page: number | undefined, totalPages: number): number {
+    return Math.min(Math.max(0, page ?? 0), Math.max(1, totalPages) - 1);
+  }
+
+  function buildCliTakeoverScanResult(options: { lightweight?: boolean } = {}): CodexCliScanResult {
+    if (input.cliScannerResult) {
+      try {
+        return input.cliScannerResult();
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    }
+    if (input.cliScanner) {
+      try {
+        return { ok: true, sessions: input.cliScanner() };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    }
+    return scanCodexCliSessionsResult(options.lightweight ? { includeRolloutMetadata: false } : {});
+  }
+
+  function resolveTakeoverSummary(input: {
+    goalSummary?: string;
+    goalSummarySourceText?: string;
+    threadName?: string;
+    firstText?: string;
+    lastText?: string;
+    checkpointOutput?: string;
+  }): string | undefined {
+    const candidates = [
+      input.goalSummary,
+      input.goalSummarySourceText,
+      input.threadName,
+      input.firstText,
+      input.lastText,
+      input.checkpointOutput
+    ];
+    for (const item of candidates) {
+      if (typeof item === 'string' && item.trim() !== '') return item;
+    }
+    return undefined;
+  }
+
+  function collectExistingCodexTasksByThread(threadId: string): Map<string, CommunicateTaskRecord> {
+    const existingByThread = new Map<string, CommunicateTaskRecord>();
+    for (const task of store.listTasksByThread(threadId)) {
+      if (task.codexThreadId) {
+        existingByThread.set(task.codexThreadId, task);
+      }
+    }
+    for (const task of recoveredTasks.values()) {
+      if (task.threadId !== threadId) continue;
+      if (task.codexThreadId && !existingByThread.has(task.codexThreadId)) {
+        existingByThread.set(task.codexThreadId, task);
+      }
+    }
+    return existingByThread;
+  }
+
+  function collectManagedHotCodexThreadIds(): Set<string> {
+    const hotCodexThreadIds = new Set<string>();
+    for (const [taskId, session] of sessions) {
+      const snapshot = session.getSnapshot?.();
+      const codexThreadId = snapshot?.codexThreadId ?? getTaskRecord(taskId)?.codexThreadId;
+      if (typeof codexThreadId === 'string' && codexThreadId.trim() !== '') {
+        hotCodexThreadIds.add(codexThreadId);
+      }
+    }
+    return hotCodexThreadIds;
+  }
+
+  function resolveHotManagedCodexThreadConflict(
+    task: Pick<CommunicateTaskRecord, 'id' | 'threadId' | 'codexThreadId'>
+  ): { taskId: `T${number}`; threadId?: string } | undefined {
+    if (!task.codexThreadId) {
+      return undefined;
+    }
+    for (const [taskId, session] of sessions) {
+      if (taskId === task.id) continue;
+      const snapshot = session.getSnapshot?.();
+      const managedCodexThreadId = snapshot?.codexThreadId ?? getTaskRecord(taskId)?.codexThreadId;
+      if (managedCodexThreadId !== task.codexThreadId) continue;
+      return {
+        taskId,
+        threadId: getTaskRecord(taskId)?.threadId
+      };
+    }
+    return undefined;
+  }
+
+  function describeHotManagedCodexThreadConflict(
+    task: Pick<CommunicateTaskRecord, 'id' | 'threadId' | 'codexThreadId'>,
+    conflict = resolveHotManagedCodexThreadConflict(task)
+  ): string | undefined {
+    if (!conflict) {
+      return undefined;
+    }
+    if (conflict.threadId && conflict.threadId === task.threadId) {
+      return `任务 ${task.id} 对应的本地 Codex 会话已被当前线程中的 ${conflict.taskId} 接管，请刷新后重试。`;
+    }
+    return `任务 ${task.id} 对应的本地 Codex 会话已被其它飞书线程接管，请刷新后重试。`;
+  }
+
+  function importScannedCliSessionsForThread(
+    threadId: string,
+    sessionsFound: CodexCliSessionInfo[]
+  ): Map<string, CommunicateTaskRecord> {
+    const existingByThread = collectExistingCodexTasksByThread(threadId);
+    const hotManagedCodexThreadIds = collectManagedHotCodexThreadIds();
+    const protectedModelsByTaskId = new Map<`T${number}`, string>();
+    for (const task of existingByThread.values()) {
+      const knownModel =
+        normalizeCommunicateTaskModel(task.model) ??
+        normalizeCommunicateTaskModel(sessionRegistry.getSessionRecord(task.id)?.model);
+      if (knownModel) {
+        protectedModelsByTaskId.set(task.id, knownModel);
+      }
+    }
+
+    for (const session of sessionsFound) {
+      if (!session.threadId) continue;
+      if (hotManagedCodexThreadIds.has(session.threadId)) {
+        existingByThread.delete(session.threadId);
+        continue;
+      }
+      const existing = existingByThread.get(session.threadId);
+      if (existing) {
+        const nextPatch: Partial<CommunicateTaskRecord> = {};
+        const persistedExistingModel = normalizeCommunicateTaskModel(sessionRegistry.getSessionRecord(existing.id)?.model);
+        const knownExistingModel = normalizeCommunicateTaskModel(existing.model) ?? persistedExistingModel;
+        if (!existing.cwd && session.cwd) {
+          nextPatch.cwd = session.cwd;
+        }
+        if (!existing.goalSummarySourceText) {
+          nextPatch.goalSummarySourceText = resolveTakeoverSummary({
+            threadName: session.threadName,
+            firstText: session.firstText,
+            lastText: session.lastText
+          });
+        }
+        if (!existing.firstUserCodingText && session.firstText) {
+          nextPatch.firstUserCodingText = normalizeFirstUserCodingText(session.firstText);
+        }
+        if (!existing.checkpointOutput && session.lastText) {
+          nextPatch.checkpointOutput = session.lastText;
+        }
+        const existingLastEventAtMs = parseIsoTimestampMs(existing.lastEventAt);
+        const scannedUpdatedAtMs = parseIsoTimestampMs(session.updatedAt);
+        if (
+          session.updatedAt &&
+          scannedUpdatedAtMs !== undefined &&
+          (existingLastEventAtMs === undefined || scannedUpdatedAtMs >= existingLastEventAtMs)
+        ) {
+          nextPatch.lastEventAt = session.updatedAt;
+        }
+        if (knownExistingModel) {
+          if (existing.model !== knownExistingModel) {
+            nextPatch.model = knownExistingModel;
+          }
+        } else if (typeof session.model === 'string') {
+          nextPatch.model = session.model;
+        }
+        if (Object.keys(nextPatch).length > 0) {
+          const updated = updateKnownTask(existing.id, nextPatch);
+          if (updated) {
+            syncRegistryRecord(updated, sessions.get(updated.id));
+            existingByThread.set(session.threadId, updated);
+          }
+        }
+        continue;
+      }
+
+      const reservedTaskId = sessionRegistry.reserveNextTaskId();
+      const created = store.createTask({
+        id: reservedTaskId,
+        taskType: 'codex_session',
+        threadId,
+        lifecycle: 'IDLE',
+        codexThreadId: session.threadId,
+        model: session.model,
+        cwd: session.cwd,
+        checkpointOutput: session.lastText,
+        lastEventAt: session.updatedAt,
+        approvalPolicy: DEFAULT_CODEX_APPROVAL_POLICY,
+        sandbox: DEFAULT_CODEX_SANDBOX,
+        sessionKind: 'coding',
+        interruptedByRestart: true,
+        startupMode: 'resume',
+        goalSummarySourceText: normalizeGoalSummarySourceText(session.threadName) ?? normalizeGoalSummarySourceText(session.firstText),
+        firstUserCodingText: normalizeFirstUserCodingText(session.firstText)
+      });
+      if (created.id !== reservedTaskId) {
+        throw new Error(`Task ID registry desync: expected ${reservedTaskId}, received ${created.id}.`);
+      }
+      syncRegistryRecord(created);
+      queueGoalSummaryGeneration(created.id, created.goalSummarySourceText);
+      existingByThread.set(session.threadId, created);
+    }
+
+    for (const [taskId, protectedModel] of protectedModelsByTaskId) {
+      const current = getTaskRecord(taskId);
+      if (!current || current.model === protectedModel) continue;
+      const updated = updateKnownTask(taskId, { model: protectedModel });
+      if (!updated) continue;
+      syncRegistryRecord(updated, sessions.get(updated.id));
+      if (updated.codexThreadId) {
+        existingByThread.set(updated.codexThreadId, updated);
+      }
+    }
+
+    return existingByThread;
+  }
+
+  function isTakeoverPickerCandidate(task?: CommunicateTaskRecord): task is CommunicateTaskRecord {
+    if (!task) return false;
+    return (
+      task.taskType === 'codex_session' &&
+      task.sessionKind === 'coding' &&
+      task.lifecycle !== 'CLOSED' &&
+      Boolean(task.codexThreadId) &&
+      !sessions.has(task.id) &&
+      !resolveHotManagedCodexThreadConflict(task)
+    );
+  }
+
+  function collectTakeoverCandidateSessionsForThread(
+    threadId: string,
+    sessionsFound: CodexCliSessionInfo[]
+  ): CodexCliSessionInfo[] {
+    const existingByThread = collectExistingCodexTasksByThread(threadId);
+    const hotManagedCodexThreadIds = collectManagedHotCodexThreadIds();
+    const candidates: CodexCliSessionInfo[] = [];
+    for (const session of sessionsFound) {
+      if (!session.threadId) continue;
+      if (hotManagedCodexThreadIds.has(session.threadId)) {
+        existingByThread.delete(session.threadId);
+        continue;
+      }
+      const existing = existingByThread.get(session.threadId);
+      if (existing && !isTakeoverPickerCandidate(existing)) {
+        continue;
+      }
+      candidates.push(session);
+    }
+    return candidates;
+  }
+
+  function buildTakeoverPickerSnapshot(threadId: string):
+    | { ok: true; snapshot: TakeoverPickerSnapshotRecord }
+    | { ok: false; error: string } {
+    const scanResult = buildCliTakeoverScanResult({ lightweight: true });
+    if (!scanResult.ok) {
+      return { ok: false, error: describeTakeoverScanError(scanResult.error) };
+    }
+    const candidateSessions = collectTakeoverCandidateSessionsForThread(threadId, scanResult.sessions);
+    return {
+      ok: true,
+      snapshot: {
+        sessions: candidateSessions,
+        snapshotUpdatedAt: formatTakeoverPickerSnapshotUpdatedAt(),
+        totalPages: resolveTakeoverPickerTotalPagesForCount(candidateSessions.length)
+      }
+    };
+  }
+
+  function hydrateTakeoverPickerSnapshotPage(
+    threadId: string,
+    snapshot: TakeoverPickerSnapshotRecord,
+    page: number
+  ): {
+    page: number;
+    taskIds: Array<`T${number}`>;
+    totalPages: number;
+    snapshotUpdatedAt: string;
+  } {
+    const nextPage = clampTakeoverPickerPage(page, snapshot.totalPages);
+    const pageSessions = snapshot.sessions.slice(
+      nextPage * TAKEOVER_PICKER_PAGE_SIZE,
+      nextPage * TAKEOVER_PICKER_PAGE_SIZE + TAKEOVER_PICKER_PAGE_SIZE
+    );
+    const existingByThread = importScannedCliSessionsForThread(threadId, pageSessions);
+    const taskIds: Array<`T${number}`> = [];
+    for (const session of pageSessions) {
+      const task = existingByThread.get(session.threadId);
+      if (!isTakeoverPickerCandidate(task)) continue;
+      taskIds.push(task.id);
+    }
+    return {
+      page: nextPage,
+      taskIds,
+      totalPages: snapshot.totalPages,
+      snapshotUpdatedAt: snapshot.snapshotUpdatedAt
+    };
+  }
+
+  function applyTakeoverPickerSnapshotPage(
+    threadId: string,
+    snapshot: TakeoverPickerSnapshotRecord,
+    page: number,
+    options: { selectedTaskId?: `T${number}`; error?: string } = {}
+  ): void {
+    const hydrated = hydrateTakeoverPickerSnapshotPage(threadId, snapshot, page);
+    const selectedTaskId =
+      options.selectedTaskId && hydrated.taskIds.includes(options.selectedTaskId) ? options.selectedTaskId : undefined;
+    setThreadUiState(threadId, {
+      statusCardMode: 'takeover_picker',
+      statusCardPickerOpen: false,
+      takeoverPickerTaskIds: hydrated.taskIds,
+      takeoverPickerPage: hydrated.page,
+      takeoverPickerTotalPages: hydrated.totalPages,
+      takeoverPickerSelectedTaskId: selectedTaskId,
+      takeoverPickerSnapshotUpdatedAt: hydrated.snapshotUpdatedAt,
+      takeoverPickerError: options.error
+    });
+  }
+
+  function showTakeoverPickerPage(
+    threadId: string,
+    page: number,
+    selectedTaskId?: `T${number}`
+  ): void {
+    const currentUi = getThreadUiState(threadId);
+    if (currentUi.takeoverPickerTotalPages === undefined) {
+      const totalPages = resolveTakeoverPickerTotalPagesForCount(currentUi.takeoverPickerTaskIds?.length ?? 0);
+      const nextPage = clampTakeoverPickerPage(page, totalPages);
+      const nextSelectedTaskId =
+        selectedTaskId && (currentUi.takeoverPickerTaskIds?.includes(selectedTaskId) ?? false)
+          ? selectedTaskId
+          : undefined;
+      setThreadUiState(threadId, {
+        statusCardMode: 'takeover_picker',
+        statusCardPickerOpen: false,
+        takeoverPickerPage: nextPage,
+        takeoverPickerSelectedTaskId: nextSelectedTaskId
+      });
+      return;
+    }
+
+    let snapshot = takeoverPickerSnapshots.get(threadId);
+    if (!snapshot) {
+      const rebuilt = buildTakeoverPickerSnapshot(threadId);
+      if (!rebuilt.ok) {
+        setThreadUiState(threadId, {
+          statusCardMode: 'takeover_picker',
+          statusCardPickerOpen: false,
+          takeoverPickerSelectedTaskId: undefined,
+          takeoverPickerError: rebuilt.error
+        });
+        return;
+      }
+      snapshot = rebuilt.snapshot;
+      takeoverPickerSnapshots.set(threadId, snapshot);
+      pruneImportedTakeoverPlaceholdersForThreadByCodexThreadIds(
+        threadId,
+        snapshot.sessions.map((session) => session.threadId)
+      );
+    }
+
+    applyTakeoverPickerSnapshotPage(threadId, snapshot, page, { selectedTaskId });
+  }
+
+  function resolveTakeoverPickerTaskSnapshot(
+    threadId: string,
+    taskId: `T${number}`
+  ): CommunicateTaskRecord | undefined {
+    const task = getTaskRecord(taskId);
+    if (!task || task.threadId !== threadId || !isTakeoverPickerCandidate(task)) {
+      return undefined;
+    }
+    return task;
+  }
+
+  function resolveTakeoverPickerTaskSummary(task: CommunicateTaskRecord): string | undefined {
+    const candidates = [
+      task.firstUserCodingText,
+      task.goalSummarySourceText,
+      task.goalSummary,
+      task.checkpointOutput
+    ];
+    for (const candidate of candidates) {
+      const summary = formatTakeoverPickerSummary(candidate);
+      if (summary) {
+        return summary;
+      }
+    }
+    return undefined;
+  }
+
+  function resolveTakeoverPickerUpdatedAtLabel(task: CommunicateTaskRecord): string | undefined {
+    const parsed = parseIsoTimestampMs(task.lastEventAt);
+    if (parsed === undefined) return undefined;
+    return formatReplyStatusUpdatedLabel(Math.max(0, Date.now() - parsed));
+  }
+
+  function buildTakeoverPickerCardInput(
+    threadId: string,
+    ui: SessionThreadUiStateRecord
+  ):
+    | {
+        fallbackToStatus: true;
+      }
+    | {
+        fallbackToStatus: false;
+        tasks: Array<{
+          taskId: string;
+          lifecycle: string;
+          cwd?: string;
+          summary?: string;
+          updatedAtLabel?: string;
+        }>;
+        page: number;
+        totalPages: number;
+        selectedTaskId?: `T${number}`;
+        snapshotUpdatedAt?: string;
+        error?: string;
+      } {
+    const snapshotTaskIds = ui.takeoverPickerTaskIds ?? [];
+    const snapshotTasks = snapshotTaskIds
+      .map((taskId) => resolveTakeoverPickerTaskSnapshot(threadId, taskId))
+      .filter((task): task is CommunicateTaskRecord => Boolean(task));
+    if (snapshotTaskIds.length > 0 && snapshotTasks.length === 0) {
+      if (ui.takeoverPickerError) {
+        setThreadUiState(threadId, {
+          statusCardMode: 'takeover_picker',
+          takeoverPickerTaskIds: [],
+          takeoverPickerPage: 0,
+          takeoverPickerSelectedTaskId: undefined
+        });
+        return {
+          fallbackToStatus: false,
+          tasks: [],
+          page: 0,
+          totalPages: 1,
+          selectedTaskId: undefined,
+          snapshotUpdatedAt: ui.takeoverPickerSnapshotUpdatedAt,
+          error: ui.takeoverPickerError
+        };
+      }
+      setThreadUiState(threadId, {
+        statusCardMode: 'status',
+        takeoverPickerTaskIds: undefined,
+        takeoverPickerPage: undefined,
+        takeoverPickerSelectedTaskId: undefined,
+        takeoverPickerSnapshotUpdatedAt: undefined,
+        takeoverPickerError: undefined
+      });
+      return { fallbackToStatus: true };
+    }
+
+    const legacyInlineSnapshot = ui.takeoverPickerTotalPages === undefined;
+    const totalPages = legacyInlineSnapshot
+      ? resolveTakeoverPickerTotalPagesForCount(snapshotTasks.length)
+      : Math.max(1, ui.takeoverPickerTotalPages ?? 1);
+    const page = clampTakeoverPickerPage(ui.takeoverPickerPage, totalPages);
+    const visibleTasks = legacyInlineSnapshot
+      ? snapshotTasks.slice(page * TAKEOVER_PICKER_PAGE_SIZE, page * TAKEOVER_PICKER_PAGE_SIZE + TAKEOVER_PICKER_PAGE_SIZE)
+      : snapshotTasks;
+    const selectedTaskId =
+      ui.takeoverPickerSelectedTaskId && visibleTasks.some((task) => task.id === ui.takeoverPickerSelectedTaskId)
+        ? ui.takeoverPickerSelectedTaskId
+        : undefined;
+    return {
+      fallbackToStatus: false,
+      tasks: visibleTasks.map((task) => ({
+        taskId: task.id,
+        lifecycle: resolveTaskLifecycleFromSnapshot(task, sessions.get(task.id)?.getSnapshot?.()),
+        cwd: task.cwd,
+        summary: resolveTakeoverPickerTaskSummary(task),
+        updatedAtLabel: resolveTakeoverPickerUpdatedAtLabel(task)
+      })),
+      page,
+      totalPages,
+      selectedTaskId,
+      snapshotUpdatedAt: ui.takeoverPickerSnapshotUpdatedAt,
+      error: ui.takeoverPickerError
+    };
+  }
+
+  function openTakeoverPickerState(threadId: string): void {
+    const currentUi = getThreadUiState(threadId);
+    const collected = buildTakeoverPickerSnapshot(threadId);
+    if (!collected.ok) {
+      setThreadUiState(threadId, {
+        statusCardMode: 'takeover_picker',
+        statusCardPickerOpen: false,
+        takeoverPickerTaskIds: currentUi.takeoverPickerTaskIds,
+        takeoverPickerPage: currentUi.takeoverPickerPage ?? 0,
+        takeoverPickerTotalPages: currentUi.takeoverPickerTotalPages,
+        takeoverPickerSelectedTaskId: undefined,
+        takeoverPickerSnapshotUpdatedAt: currentUi.takeoverPickerSnapshotUpdatedAt,
+        takeoverPickerError: collected.error
+      });
+      return;
+    }
+
+    takeoverPickerSnapshots.set(threadId, collected.snapshot);
+    pruneImportedTakeoverPlaceholdersForThreadByCodexThreadIds(
+      threadId,
+      collected.snapshot.sessions.map((session) => session.threadId)
+    );
+    applyTakeoverPickerSnapshotPage(threadId, collected.snapshot, 0);
+  }
+
+  function refreshTakeoverPickerState(threadId: string): void {
+    const currentUi = getThreadUiState(threadId);
+    const collected = buildTakeoverPickerSnapshot(threadId);
+    if (!collected.ok) {
+      setThreadUiState(threadId, {
+        statusCardMode: 'takeover_picker',
+        statusCardPickerOpen: false,
+        takeoverPickerTaskIds: currentUi.takeoverPickerTaskIds,
+        takeoverPickerPage: currentUi.takeoverPickerPage ?? 0,
+        takeoverPickerTotalPages: currentUi.takeoverPickerTotalPages,
+        takeoverPickerSelectedTaskId: undefined,
+        takeoverPickerSnapshotUpdatedAt: currentUi.takeoverPickerSnapshotUpdatedAt,
+        takeoverPickerError: collected.error
+      });
+      return;
+    }
+
+    takeoverPickerSnapshots.set(threadId, collected.snapshot);
+    pruneImportedTakeoverPlaceholdersForThreadByCodexThreadIds(
+      threadId,
+      collected.snapshot.sessions.map((session) => session.threadId)
+    );
+    applyTakeoverPickerSnapshotPage(threadId, collected.snapshot, 0);
+  }
+
   function isRecoverableCodingTask(task?: CommunicateTaskRecord): task is CommunicateTaskRecord {
     if (!task) return false;
     return (
       task.taskType === 'codex_session' &&
       task.sessionKind === 'coding' &&
       task.lifecycle !== 'CLOSED' &&
-      (sessions.has(task.id) || Boolean(task.codexThreadId))
+      (sessions.has(task.id) || Boolean(task.codexThreadId)) &&
+      !isImportedTakeoverPlaceholderTask(task)
     );
   }
 
@@ -2395,7 +3092,10 @@ export function createFeishuService(input: {
   function resolveStatusCardRenderMode(
     ui: SessionThreadUiStateRecord,
     pickerTasks: Array<NonNullable<ReturnType<typeof toPickerTaskCardInput>>>
-  ): 'status' | 'launcher' | 'launcher_with_error' {
+  ): 'status' | 'launcher' | 'launcher_with_error' | 'takeover_picker' {
+    if (ui.statusCardMode === 'takeover_picker') {
+      return 'takeover_picker';
+    }
     if (ui.statusCardMode === 'launcher') {
       return ui.launcherError ? 'launcher_with_error' : 'launcher';
     }
@@ -2407,11 +3107,12 @@ export function createFeishuService(input: {
     options?: { assistantTaskResolver?: (threadId: string) => CommunicateTaskRecord | undefined }
   ): {
     ui: SessionThreadUiStateRecord;
-    mode: 'status' | 'launcher' | 'launcher_with_error';
+    mode: 'status' | 'launcher' | 'launcher_with_error' | 'takeover_picker';
     pickerTasks: Array<NonNullable<ReturnType<typeof toPickerTaskCardInput>>>;
     launcherSelectedCwd?: string;
     card: Record<string, unknown>;
   } {
+    resolveCurrentCodingTaskSnapshot(threadId);
     const ui = getThreadUiState(threadId);
     const pickerTasks = listActiveCodingTasksSnapshot(threadId)
       .map((task) => toPickerTaskCardInput(task))
@@ -2432,6 +3133,30 @@ export function createFeishuService(input: {
     const [firstRecentProjectDir] = recentProjectDirs;
     const launcherSelectedCwd = ui.launcherSelectedCwd ?? firstRecentProjectDir;
     const mode = resolveStatusCardRenderMode(ui, pickerTasks);
+    if (mode === 'takeover_picker') {
+      const takeoverPicker = buildTakeoverPickerCardInput(threadId, ui);
+      if (takeoverPicker.fallbackToStatus) {
+        return buildCurrentStatusCardSnapshot(threadId, options);
+      }
+      const card = renderFeishuModeStatusCard({
+        mode: 'takeover_picker',
+        displayMode: ui.displayMode,
+        currentCodingTaskId: ui.currentCodingTaskId,
+        takeoverPickerTasks: takeoverPicker.tasks,
+        takeoverPickerPage: takeoverPicker.page,
+        takeoverPickerTotalPages: takeoverPicker.totalPages,
+        takeoverPickerSelectedTaskId: takeoverPicker.selectedTaskId,
+        takeoverPickerSnapshotUpdatedAt: takeoverPicker.snapshotUpdatedAt,
+        takeoverPickerError: takeoverPicker.error
+      });
+      return {
+        ui,
+        mode,
+        pickerTasks,
+        launcherSelectedCwd,
+        card
+      };
+    }
     const card = renderFeishuModeStatusCard({
       mode,
       displayMode: ui.displayMode,
@@ -2465,7 +3190,7 @@ export function createFeishuService(input: {
   }
 
   async function refreshStatusCard(threadId: string): Promise<void> {
-    if (!input.channel.sendCard || !input.channel.updateCard) return;
+    if (!input.channel.sendCard && !input.channel.updateCard) return;
     ensureLauncherSelection(threadId);
     resolveCurrentCodingTask(threadId);
     const snapshot = buildCurrentStatusCardSnapshot(threadId, { assistantTaskResolver: resolveBoundAssistantTask });
@@ -2482,6 +3207,7 @@ export function createFeishuService(input: {
       launcherSelectedCwd: snapshot.launcherSelectedCwd
     });
     if (!ui.statusCardMessageId) {
+      if (!input.channel.sendCard) return;
       const messageId = await input.channel.sendCard(threadId, snapshot.card);
       setThreadUiState(threadId, {
         statusCardMessageId: messageId,
@@ -2489,6 +3215,22 @@ export function createFeishuService(input: {
       });
       logFeishuDebug('status card sent', {
         threadId,
+        messageId,
+        mode: snapshot.mode,
+        pickerTaskIds: snapshot.pickerTasks.map((task) => task.taskId)
+      });
+      return;
+    }
+    if (!input.channel.updateCard) {
+      if (!input.channel.sendCard) return;
+      const messageId = await input.channel.sendCard(threadId, snapshot.card);
+      setThreadUiState(threadId, {
+        statusCardMessageId: messageId,
+        statusCardActionMessageId: undefined
+      });
+      logFeishuDebug('status card update unavailable; sent replacement', {
+        threadId,
+        previousMessageId: ui.statusCardMessageId,
         messageId,
         mode: snapshot.mode,
         pickerTaskIds: snapshot.pickerTasks.map((task) => task.taskId)
@@ -2510,6 +3252,10 @@ export function createFeishuService(input: {
         targetActionMessageId: ui.statusCardActionMessageId,
         error: String(error)
       });
+      if (!input.channel.sendCard) {
+        await sendPlainText(threadId, '项目卡更新失败，请稍后重试。');
+        return;
+      }
       const messageId = await input.channel.sendCard(threadId, snapshot.card);
       setThreadUiState(threadId, {
         statusCardMessageId: messageId,
@@ -2649,17 +3395,18 @@ export function createFeishuService(input: {
       return;
     }
 
-    const existingSession = sessions.get(task.id);
-    const session = existingSession ?? (await ensureHotSessionForReply(task, 'implicit_coding_reply'));
-    if (!session) {
+    const hadExistingSession = sessions.has(task.id);
+    const ensuredSession = await ensureReplySession(task, 'implicit_coding_reply');
+    if (!ensuredSession.ok) {
       clearCurrentCodingTarget(threadId);
       await sendPlainText(
         threadId,
-        `当前 Coding 会话 ${task.id} 已中断，已切回助手模式。如需继续旧任务，请显式发送“对 ${task.id} 输入: ...”或重新创建 Coding 任务。`
+        `${ensuredSession.error} 已切回助手模式。如需继续旧任务，请显式发送“对 ${task.id} 输入: ...”或重新创建 Coding 任务。`
       );
       await handleAssistantMessage(threadId, text);
       return;
     }
+    const session = ensuredSession.session;
 
     const rawReply: CodexReplyPayload = { action: 'free_text', text: text.trim() };
     const reply = applyTaskScopedReplyGuardrails(task.id, rawReply);
@@ -2705,7 +3452,7 @@ export function createFeishuService(input: {
 
     const isRunning = task.lifecycle === 'RUNNING_TURN' || snapshot?.lifecycle === 'RUNNING_TURN';
     const ack =
-      !existingSession && task.interruptedByRestart
+      !hadExistingSession && task.interruptedByRestart
         ? '已恢复会话。上一轮因服务重启已中断，本次输入会作为新的继续指令执行。'
         : task.lifecycle === 'STARTING'
           ? '已接收输入，待会话就绪后自动执行。'
@@ -2886,8 +3633,12 @@ export function createFeishuService(input: {
         await sendPlainText(message.threadId, `任务 ${task.id} 当前状态为 ${task.lifecycle}，无需恢复。`);
         return;
       }
-      const session = await ensureHotSessionForReply(task, 'resume_closed_task');
-      if (!session) return;
+      const ensuredSession = await ensureReplySession(task, 'resume_closed_task');
+      if (!ensuredSession.ok) {
+        await sendPlainText(message.threadId, ensuredSession.error);
+        return;
+      }
+      const session = ensuredSession.session;
       await sendPlainText(message.threadId, `任务 ${task.id} 已重新打开，继续执行。`);
       return;
     }
@@ -2940,11 +3691,13 @@ export function createFeishuService(input: {
         return;
       }
       const replyTargetTask = validation.ok ? validation.task : recoverableFailedCodingTask!;
-      const existingSession = sessions.get(replyTargetTask.id);
-      const session = existingSession ?? (await ensureHotSessionForReply(replyTargetTask, 'explicit_task_reply'));
-      if (!session) {
+      const hadExistingSession = sessions.has(replyTargetTask.id);
+      const ensuredSession = await ensureReplySession(replyTargetTask, 'explicit_task_reply');
+      if (!ensuredSession.ok) {
+        await sendPlainText(message.threadId, ensuredSession.error);
         return;
       }
+      const session = ensuredSession.session;
 
       const rawReply =
         routed.params.action === 'confirm_polish_send'
@@ -3003,7 +3756,7 @@ export function createFeishuService(input: {
       }
       const isRunning = replyTargetTask.lifecycle === 'RUNNING_TURN' || snapshot?.lifecycle === 'RUNNING_TURN';
       const ack =
-        !existingSession && (replyTargetTask.interruptedByRestart || replyTargetTask.lifecycle === 'FAILED')
+        !hadExistingSession && (replyTargetTask.interruptedByRestart || replyTargetTask.lifecycle === 'FAILED')
           ? '已恢复会话。上一轮会话已中断，本次输入会作为新的继续指令执行。'
           : replyTargetTask.lifecycle === 'STARTING'
             ? '已接收输入，待会话就绪后自动执行。'
@@ -3030,6 +3783,7 @@ export function createFeishuService(input: {
     }
 
     const existingByThread = new Map<string, CommunicateTaskRecord>();
+    const hotManagedCodexThreadIds = collectManagedHotCodexThreadIds();
     for (const task of store.listTasksByThread(threadId)) {
       if (task.codexThreadId) {
         existingByThread.set(task.codexThreadId, task);
@@ -3051,6 +3805,10 @@ export function createFeishuService(input: {
 
     for (const session of sessionsFound) {
       if (!session.threadId) continue;
+      if (hotManagedCodexThreadIds.has(session.threadId)) {
+        existingByThread.delete(session.threadId);
+        continue;
+      }
       const existing = existingByThread.get(session.threadId);
       if (existing) {
         const nextPatch: Partial<CommunicateTaskRecord> = {};
@@ -3116,7 +3874,9 @@ export function createFeishuService(input: {
       typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0
         ? Math.floor(rawLimit)
         : DEFAULT_TAKEOVER_LIST_LIMIT;
-    const listSessions = sessionsFound.slice(0, listLimit);
+    const listSessions = sessionsFound
+      .filter((session) => session.threadId && !hotManagedCodexThreadIds.has(session.threadId))
+      .slice(0, listLimit);
     const resolveTakeoverSummary = (input: {
       threadName?: string;
       firstText?: string;
@@ -3179,9 +3939,55 @@ export function createFeishuService(input: {
       await sendPlainText(threadId, body + `\n\n未找到任务 ${taskId}，请先发送“接管 codex”查看列表。`);
       return;
     }
-    if (!targetTask.codexThreadId) {
-      await sendPlainText(threadId, `任务 ${taskId} 缺少可恢复的 Codex 线程标识，请重新创建会话。`);
+    const takeover = await takeoverTaskById(threadId, taskId, 'takeover_local_codex');
+    if (!takeover.ok) {
+      await sendPlainText(threadId, takeover.error);
       return;
+    }
+    const warning = takeover.warning ? `\n提示：${takeover.warning}` : '';
+    await sendPlainText(threadId, `已开始接管 ${taskId}。${warning}`);
+  }
+
+  async function takeoverTaskById(
+    threadId: string,
+    taskId: `T${number}`,
+    caller = 'takeover_local_codex'
+  ): Promise<
+    | {
+        ok: true;
+        task: CommunicateTaskRecord;
+        warning?: string;
+      }
+    | {
+        ok: false;
+        error: string;
+      }
+  > {
+    const targetTask = getTaskRecord(taskId);
+    if (!targetTask || targetTask.threadId !== threadId) {
+      return {
+        ok: false,
+        error: `任务 ${taskId} 已不可用，请刷新列表后重试。`
+      };
+    }
+    if (!targetTask.codexThreadId) {
+      return {
+        ok: false,
+        error: `任务 ${taskId} 缺少可恢复的 Codex 线程标识，请重新创建会话。`
+      };
+    }
+    const hotConflictError = describeHotManagedCodexThreadConflict(targetTask);
+    if (hotConflictError) {
+      return {
+        ok: false,
+        error: hotConflictError
+      };
+    }
+    if (sessions.has(targetTask.id)) {
+      return {
+        ok: true,
+        task: getTaskRecord(taskId) ?? targetTask
+      };
     }
 
     const processApi = input.cliProcess ?? {
@@ -3219,11 +4025,19 @@ export function createFeishuService(input: {
       errors: [...killResult.errors]
     });
 
-    const session = await ensureHotSessionForReply(targetTask, 'takeover_local_codex');
-    if (!session) return;
+    const ensuredSession = await ensureReplySession(targetTask, caller);
+    if (!ensuredSession.ok) {
+      return {
+        ok: false,
+        error: ensuredSession.error
+      };
+    }
 
-    const warning = killResult.failed ? `\n提示：未能终止 ${killResult.failed} 个 CLI 进程。` : '';
-    await sendPlainText(threadId, `已开始接管 ${taskId}。${warning}`);
+    return {
+      ok: true,
+      task: getTaskRecord(taskId) ?? targetTask,
+      warning: killResult.failed ? `未能终止 ${killResult.failed} 个 CLI 进程。` : undefined
+    };
   }
 
   function rememberClarification(threadId: string, reason: string): void {
@@ -3240,16 +4054,21 @@ export function createFeishuService(input: {
       if (!task) {
         task = await createAssistantTask(threadId);
       }
-      const session = sessions.get(task.id) ?? (await ensureHotSessionForReply(task, 'assistant_message'));
-      if (!session) {
+      const ensuredSession = await ensureReplySession(task, 'assistant_message');
+      if (!ensuredSession.ok) {
         if (!sessions.get(task.id) && !task.codexThreadId) {
           clearAssistantBinding(threadId);
           await sendPlainText(threadId, '助手会话恢复失败，已清理旧绑定。请重新发送刚才的问题。', {
             kind: 'assistant'
           }, { taskId: task.id, sessionKind: 'assistant' });
+        } else {
+          await sendPlainText(threadId, ensuredSession.error, {
+            kind: 'assistant'
+          }, { taskId: task.id, sessionKind: 'assistant' });
         }
         return;
       }
+      const session = ensuredSession.session;
 
       const reply = toAssistantReplyPayload(task, text);
       logFeishuDebug('assistant reply inbound', {
@@ -3496,9 +4315,10 @@ export function createFeishuService(input: {
   }
 
   async function handleCardAction(action: FeishuCardActionEvent): Promise<void> {
-    if (!isReplyStatusCardAction(action) && !isApprovalCardAction(action) && !isAssistantReplyReceiptAction(action)) {
-      rememberStatusCardAction(action.threadId, action);
-    }
+    const statusCardActionState =
+      !isReplyStatusCardAction(action) && !isApprovalCardAction(action) && !isAssistantReplyReceiptAction(action)
+        ? rememberStatusCardAction(action.threadId, action)
+        : 'ignored';
     logFeishuDebug('card action inbound', {
       threadId: action.threadId,
       kind: action.kind,
@@ -3506,6 +4326,11 @@ export function createFeishuService(input: {
       trackedMessageId: getThreadUiState(action.threadId).statusCardMessageId,
       trackedActionMessageId: getThreadUiState(action.threadId).statusCardActionMessageId
     });
+    if (statusCardActionState === 'mismatch' && isTakeoverPickerStatusCardAction(action)) {
+      await sendPlainText(action.threadId, '该接管卡已更新，请使用最新卡片操作。');
+      await refreshStatusCard(action.threadId);
+      return;
+    }
 
     if (action.kind === 'allow_waiting_task' || action.kind === 'deny_waiting_task') {
       const trackedApprovalCard = approvalCards.get(action.taskId);
@@ -3523,8 +4348,12 @@ export function createFeishuService(input: {
         await sendPlainText(action.threadId, `任务 ${action.taskId} 当前不再等待审批。`);
         return;
       }
-      const session = sessions.get(task.id) ?? (await ensureHotSessionForReply(task, 'approval_card_action'));
-      if (!session) return;
+      const ensuredSession = await ensureReplySession(task, 'approval_card_action');
+      if (!ensuredSession.ok) {
+        await sendPlainText(action.threadId, ensuredSession.error);
+        return;
+      }
+      const session = ensuredSession.session;
       const reply: CodexReplyPayload = {
         action: 'confirm',
         value: action.kind === 'deny_waiting_task' ? 'deny' : 'allow'
@@ -3593,8 +4422,13 @@ export function createFeishuService(input: {
         );
         return;
       }
-      const session = sessions.get(task.id) ?? (await ensureHotSessionForReply(task, 'interrupt_stalled_task'));
-      if (!session?.interruptCurrentTurn) {
+      const ensuredSession = await ensureReplySession(task, 'interrupt_stalled_task');
+      if (!ensuredSession.ok) {
+        await sendPlainText(action.threadId, ensuredSession.error);
+        return;
+      }
+      const session = ensuredSession.session;
+      if (!session.interruptCurrentTurn) {
         await sendPlainText(action.threadId, `任务 ${task.id} 当前不支持打断。`);
         return;
       }
@@ -3734,15 +4568,15 @@ export function createFeishuService(input: {
         return;
       }
       if (!sessions.has(currentTask.id)) {
-        const session = await ensureHotSessionForReply(currentTask, 'status_card_switch_current_task');
-        if (!session) {
+        const ensuredSession = await ensureReplySession(currentTask, 'status_card_switch_current_task');
+        if (!ensuredSession.ok) {
           setThreadUiState(action.threadId, {
             displayMode: 'assistant',
             statusCardMode: 'status',
             currentCodingTaskId: undefined,
             statusCardPickerOpen: false
           });
-          await sendPlainText(action.threadId, `任务 ${currentTask.id} 恢复失败，已保持助手模式。`);
+          await sendPlainText(action.threadId, `${ensuredSession.error} 已保持助手模式。`);
           await refreshStatusCard(action.threadId);
           return;
         }
@@ -3764,6 +4598,125 @@ export function createFeishuService(input: {
         statusCardPickerOpen: true
       });
       queueLazyGoalSummaryBackfills(action.threadId);
+      await refreshStatusCard(action.threadId);
+      return;
+    }
+
+    if (action.kind === 'open_takeover_picker') {
+      openTakeoverPickerState(action.threadId);
+      await refreshStatusCard(action.threadId);
+      return;
+    }
+
+    if (action.kind === 'takeover_picker_next_page' || action.kind === 'takeover_picker_prev_page') {
+      const currentUi = getThreadUiState(action.threadId);
+      const totalPages =
+        currentUi.takeoverPickerTotalPages === undefined
+          ? resolveTakeoverPickerTotalPagesForCount(currentUi.takeoverPickerTaskIds?.length ?? 0)
+          : Math.max(1, currentUi.takeoverPickerTotalPages ?? 1);
+      const currentPage = clampTakeoverPickerPage(currentUi.takeoverPickerPage, totalPages);
+      const delta = action.kind === 'takeover_picker_next_page' ? 1 : -1;
+      const nextPage = clampTakeoverPickerPage(currentPage + delta, totalPages);
+      showTakeoverPickerPage(action.threadId, nextPage, currentUi.takeoverPickerSelectedTaskId);
+      await refreshStatusCard(action.threadId);
+      return;
+    }
+
+    if (action.kind === 'refresh_takeover_picker') {
+      refreshTakeoverPickerState(action.threadId);
+      await refreshStatusCard(action.threadId);
+      return;
+    }
+
+    if (action.kind === 'pick_takeover_task') {
+      const currentUi = getThreadUiState(action.threadId);
+      const isSelectable = currentUi.takeoverPickerTaskIds?.includes(action.taskId) ?? false;
+      setThreadUiState(action.threadId, {
+        statusCardMode: 'takeover_picker',
+        statusCardPickerOpen: false,
+        takeoverPickerSelectedTaskId: isSelectable ? action.taskId : undefined,
+        takeoverPickerError: isSelectable ? undefined : '当前选择已失效，请刷新后重试。'
+      });
+      await refreshStatusCard(action.threadId);
+      return;
+    }
+
+    if (action.kind === 'confirm_takeover_task') {
+      const currentUi = getThreadUiState(action.threadId);
+      if (!currentUi.takeoverPickerSelectedTaskId) {
+        setThreadUiState(action.threadId, {
+          statusCardMode: 'takeover_picker',
+          statusCardPickerOpen: false,
+          takeoverPickerError: '请先选择一个本地 Codex 任务。'
+        });
+        await refreshStatusCard(action.threadId);
+        return;
+      }
+      const selectedTask = getTaskRecord(currentUi.takeoverPickerSelectedTaskId);
+      const selectedConflictError =
+        selectedTask && selectedTask.threadId === action.threadId
+          ? describeHotManagedCodexThreadConflict(selectedTask)
+          : undefined;
+      if (selectedConflictError) {
+        setThreadUiState(action.threadId, {
+          statusCardMode: 'takeover_picker',
+          statusCardPickerOpen: false,
+          takeoverPickerSelectedTaskId: undefined,
+          takeoverPickerError: selectedConflictError
+        });
+        await refreshStatusCard(action.threadId);
+        return;
+      }
+      const isSelectedTaskStillVisible =
+        currentUi.takeoverPickerTaskIds?.includes(currentUi.takeoverPickerSelectedTaskId) &&
+        Boolean(resolveTakeoverPickerTaskSnapshot(action.threadId, currentUi.takeoverPickerSelectedTaskId));
+      if (!isSelectedTaskStillVisible) {
+        setThreadUiState(action.threadId, {
+          statusCardMode: 'takeover_picker',
+          statusCardPickerOpen: false,
+          takeoverPickerSelectedTaskId: undefined,
+          takeoverPickerError: '当前选择已失效，请刷新后重试。'
+        });
+        await refreshStatusCard(action.threadId);
+        return;
+      }
+      const takeover = await takeoverTaskById(
+        action.threadId,
+        currentUi.takeoverPickerSelectedTaskId,
+        'status_card_confirm_takeover'
+      );
+      if (!takeover.ok) {
+        setThreadUiState(action.threadId, {
+          statusCardMode: 'takeover_picker',
+          statusCardPickerOpen: false,
+          takeoverPickerError: takeover.error
+        });
+        await refreshStatusCard(action.threadId);
+        return;
+      }
+      setThreadUiState(action.threadId, {
+        displayMode: 'coding',
+        statusCardMode: 'status',
+        currentCodingTaskId: takeover.task.id,
+        statusCardPickerOpen: false
+      });
+      takeoverPickerSnapshots.delete(action.threadId);
+      pruneImportedTakeoverPlaceholdersForThread(action.threadId, [takeover.task.id]);
+      await sendPlainText(
+        action.threadId,
+        takeover.warning ? `已开始接管 ${takeover.task.id}。\n提示：${takeover.warning}` : `已开始接管 ${takeover.task.id}。`
+      );
+      await refreshStatusCard(action.threadId);
+      return;
+    }
+
+    if (action.kind === 'return_to_status') {
+      takeoverPickerSnapshots.delete(action.threadId);
+      pruneImportedTakeoverPlaceholdersForThread(action.threadId);
+      setThreadUiState(action.threadId, {
+        statusCardMode: 'status',
+        statusCardPickerOpen: false
+      });
       await refreshStatusCard(action.threadId);
       return;
     }
@@ -3815,15 +4768,15 @@ export function createFeishuService(input: {
         return;
       }
       if (!sessions.has(task.id)) {
-        const session = await ensureHotSessionForReply(task, 'status_card_open_task');
-        if (!session) {
+        const ensuredSession = await ensureReplySession(task, 'status_card_open_task');
+        if (!ensuredSession.ok) {
           setThreadUiState(action.threadId, {
             displayMode: 'assistant',
             statusCardMode: 'status',
             currentCodingTaskId: undefined,
             statusCardPickerOpen: false
           });
-          await sendPlainText(action.threadId, `任务 ${action.taskId} 恢复失败，已保持助手模式。`);
+          await sendPlainText(action.threadId, `${ensuredSession.error} 已保持助手模式。`);
           await refreshStatusCard(action.threadId);
           return;
         }
@@ -4383,6 +5336,60 @@ export function createFeishuService(input: {
     return Object.keys(context).length > 0 ? context : undefined;
   }
 
+  async function ensureReplySession(
+    task: CommunicateTaskRecord,
+    caller = 'unknown'
+  ): Promise<
+    | {
+        ok: true;
+        session: CodexSessionLike;
+      }
+    | {
+        ok: false;
+        error: string;
+      }
+  > {
+    const existing = sessions.get(task.id);
+    if (existing) {
+      return { ok: true, session: existing };
+    }
+    if (task.taskType !== 'codex_session') {
+      return {
+        ok: false,
+        error: `任务 ${task.id} 不是 Codex 会话，无法恢复。`
+      };
+    }
+    if (!task.codexThreadId) {
+      return {
+        ok: false,
+        error: `任务 ${task.id} 缺少可恢复的 Codex 线程标识，请重新创建会话。`
+      };
+    }
+    const hotConflict = resolveHotManagedCodexThreadConflict(task);
+    if (hotConflict) {
+      logFeishuDebug('session ensure hot conflict', {
+        caller,
+        taskId: task.id,
+        threadId: task.threadId,
+        codexThreadId: task.codexThreadId,
+        conflictTaskId: hotConflict.taskId,
+        conflictThreadId: hotConflict.threadId ?? null
+      });
+      return {
+        ok: false,
+        error: describeHotManagedCodexThreadConflict(task, hotConflict) ?? `任务 ${task.id} 恢复失败，请稍后重试。`
+      };
+    }
+    const session = await ensureHotSessionForReply(task, caller);
+    if (!session) {
+      return {
+        ok: false,
+        error: `任务 ${task.id} 恢复失败，请稍后重试。`
+      };
+    }
+    return { ok: true, session };
+  }
+
   async function ensureHotSessionForReply(
     task: CommunicateTaskRecord,
     caller = 'unknown'
@@ -4408,17 +5415,10 @@ export function createFeishuService(input: {
     }
     if (task.taskType !== 'codex_session') return undefined;
     if (!task.codexThreadId) {
-      if (isAssistantTask(task)) {
-        return undefined;
-      }
       logFeishuDebug('session ensure missing thread id', {
         caller,
         taskId: task.id,
         threadId: task.threadId
-      });
-      await sendPlainText(task.threadId, `任务 ${task.id} 缺少可恢复的 Codex 线程标识，请重新创建会话。`, {
-        kind: 'coding',
-        taskId: task.id
       });
       return undefined;
     }
@@ -4808,6 +5808,33 @@ function extractSummaryLine(text: string, maxChars = 160): string | undefined {
     return `${line.slice(0, Math.max(0, maxChars - 3))}...`;
   }
   return undefined;
+}
+
+function formatTakeoverPickerSummary(text: string | undefined): string | undefined {
+  const meaningful = normalizeMeaningfulSummaryText(text);
+  const normalized = meaningful
+    ?.replace(/\r\n/g, '\n')
+    .replace(/\n{2}\[图片\]\n(?:- .*(?:\n|$))*$/u, '')
+    .trim();
+  if (!normalized) {
+    return undefined;
+  }
+  const firstLine = normalized
+    .split(/\r?\n/)
+    .map((line: string) => line.trim())
+    .find((line: string) => line !== '' && line !== '```');
+  if (!firstLine) {
+    return undefined;
+  }
+  const compact = firstLine.replace(/\s+/g, ' ').trim();
+  if (!compact) {
+    return undefined;
+  }
+  const glyphs = Array.from(compact);
+  if (glyphs.length <= TAKEOVER_PICKER_SUMMARY_MAX_CHARS) {
+    return compact;
+  }
+  return `${glyphs.slice(0, Math.max(0, TAKEOVER_PICKER_SUMMARY_MAX_CHARS - 3)).join('')}...`;
 }
 
 function readLatestUserFacingReplyLogBlock(logFilePath: string): string | undefined {

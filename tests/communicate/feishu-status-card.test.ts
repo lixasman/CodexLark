@@ -594,3 +594,181 @@ test('status card renders launcher error state while keeping recent dirs and inp
   assert.ok(textContents.some((content) => content.includes('D:\\Workspace\\Project')));
   assert.equal(inputs[0]?.default_value, 'D:\\Broken');
 });
+
+test('status card renders local codex takeover button in status mode', () => {
+  const card = renderFeishuModeStatusCard({
+    displayMode: 'coding',
+    currentCodingTaskId: 'T9',
+    currentTaskLifecycle: 'IDLE'
+  } as any) as {
+    schema?: string;
+    body?: { elements?: Array<Record<string, unknown>> };
+  };
+
+  assert.equal(card.schema, '2.0');
+
+  const buttons = collectButtons(card.body);
+  const byLabel = new Map(
+    buttons.map((button) => [String((button.text as Record<string, unknown>)?.content ?? ''), button])
+  );
+
+  assert.equal(byLabel.get('接管本地 Codex')?.type, 'primary');
+  assert.deepEqual(byLabel.get('接管本地 Codex')?.behaviors, [
+    { type: 'callback', value: { kind: 'open_takeover_picker' } }
+  ]);
+  assert.ok(byLabel.has('切换当前任务'));
+  assert.ok(byLabel.has('新建任务'));
+  assert.ok(byLabel.has('返回启动卡'));
+});
+
+test('status card renders takeover picker first page with selected task, snapshot timestamp, and forward navigation', () => {
+  const card = renderFeishuModeStatusCard({
+    mode: 'takeover_picker',
+    displayMode: 'assistant',
+    takeoverPickerTasks: [
+      {
+        taskId: 'T11',
+        lifecycle: 'IDLE',
+        cwd: 'D:\\Workspace\\Alpha',
+        summary: '任务摘要 1',
+        updatedAtLabel: '2026-04-21 10:00'
+      },
+      {
+        taskId: 'T12',
+        lifecycle: 'RUNNING_TURN',
+        cwd: 'D:\\Workspace\\Beta',
+        summary: '任务摘要 2',
+        updatedAtLabel: '2026-04-21 09:58'
+      },
+      {
+        taskId: 'T13',
+        lifecycle: 'WAITING_USER',
+        cwd: 'D:\\Workspace\\Gamma',
+        summary: '任务摘要 3',
+        updatedAtLabel: '2026-04-21 09:55'
+      },
+      {
+        taskId: 'T14',
+        lifecycle: 'FAILED',
+        cwd: 'D:\\Workspace\\Delta',
+        summary: '任务摘要 4',
+        updatedAtLabel: '2026-04-21 09:50'
+      },
+      {
+        taskId: 'T15',
+        lifecycle: 'IDLE',
+        cwd: 'D:\\Workspace\\Omega',
+        summary: '任务摘要 5',
+        updatedAtLabel: '2026-04-21 09:40'
+      }
+    ],
+    takeoverPickerPage: 0,
+    takeoverPickerTotalPages: 3,
+    takeoverPickerSelectedTaskId: 'T12',
+    takeoverPickerSnapshotUpdatedAt: '2026-04-21 10:01'
+  } as any) as {
+    schema?: string;
+    body?: { elements?: Array<Record<string, unknown>> };
+  };
+
+  assert.equal(card.schema, '2.0');
+
+  const textContents = collectTextContents(card.body);
+  const buttons = collectButtons(card.body);
+  const byLabel = new Map(
+    buttons.map((button) => [String((button.text as Record<string, unknown>)?.content ?? ''), button])
+  );
+
+  assert.ok(textContents.some((content) => content.includes('本地 Codex 接管')));
+  assert.ok(textContents.some((content) => content.includes('快照时间：2026-04-21 10:01')));
+  assert.ok(textContents.some((content) => content.includes('已选中：T12')));
+  assert.ok(textContents.some((content) => content.includes('任务摘要：任务摘要 1')));
+  assert.ok(textContents.some((content) => content.includes('任务摘要：任务摘要 5')));
+  assert.equal(byLabel.has('上一页'), false);
+  assert.equal(byLabel.get('下一页')?.type, 'primary');
+  assert.deepEqual(byLabel.get('下一页')?.behaviors, [
+    { type: 'callback', value: { kind: 'takeover_picker_next_page' } }
+  ]);
+  assert.deepEqual(byLabel.get('刷新列表')?.behaviors, [
+    { type: 'callback', value: { kind: 'refresh_takeover_picker' } }
+  ]);
+  assert.deepEqual(byLabel.get('确认接管')?.behaviors, [
+    { type: 'callback', value: { kind: 'confirm_takeover_task' } }
+  ]);
+  assert.deepEqual(byLabel.get('返回状态卡')?.behaviors, [
+    { type: 'callback', value: { kind: 'return_to_status' } }
+  ]);
+  assert.deepEqual(byLabel.get('选择 T12')?.behaviors, [
+    { type: 'callback', value: { kind: 'pick_takeover_task', taskId: 'T12' } }
+  ]);
+});
+
+test('status card renders empty takeover picker state', () => {
+  const card = renderFeishuModeStatusCard({
+    mode: 'takeover_picker',
+    displayMode: 'assistant',
+    takeoverPickerTasks: [],
+    takeoverPickerPage: 0,
+    takeoverPickerTotalPages: 1
+  } as any) as {
+    schema?: string;
+    body?: { elements?: Array<Record<string, unknown>> };
+  };
+
+  const textContents = collectTextContents(card.body);
+  assert.ok(textContents.some((content) => content.includes('当前没有可接管的本地 Codex Coding 会话')));
+});
+
+test('status card renders takeover picker last page with backward navigation only', () => {
+  const card = renderFeishuModeStatusCard({
+    mode: 'takeover_picker',
+    displayMode: 'assistant',
+    takeoverPickerTasks: [
+      {
+        taskId: 'T21',
+        lifecycle: 'IDLE',
+        cwd: 'D:\\Workspace\\Tail',
+        summary: '最后一页'
+      }
+    ],
+    takeoverPickerPage: 2,
+    takeoverPickerTotalPages: 3
+  } as any) as {
+    schema?: string;
+    body?: { elements?: Array<Record<string, unknown>> };
+  };
+
+  const buttons = collectButtons(card.body);
+  const byLabel = new Map(
+    buttons.map((button) => [String((button.text as Record<string, unknown>)?.content ?? ''), button])
+  );
+
+  assert.deepEqual(byLabel.get('上一页')?.behaviors, [
+    { type: 'callback', value: { kind: 'takeover_picker_prev_page' } }
+  ]);
+  assert.equal(byLabel.has('下一页'), false);
+});
+
+test('status card renders takeover picker error state without hiding refresh controls', () => {
+  const card = renderFeishuModeStatusCard({
+    mode: 'takeover_picker',
+    displayMode: 'assistant',
+    takeoverPickerTasks: [],
+    takeoverPickerPage: 0,
+    takeoverPickerTotalPages: 1,
+    takeoverPickerError: '扫描本地 Codex 会话失败。'
+  } as any) as {
+    schema?: string;
+    body?: { elements?: Array<Record<string, unknown>> };
+  };
+
+  const textContents = collectTextContents(card.body);
+  const buttons = collectButtons(card.body);
+  const byLabel = new Map(
+    buttons.map((button) => [String((button.text as Record<string, unknown>)?.content ?? ''), button])
+  );
+
+  assert.ok(textContents.some((content) => content.includes('扫描本地 Codex 会话失败。')));
+  assert.ok(byLabel.has('刷新列表'));
+  assert.ok(byLabel.has('返回状态卡'));
+});

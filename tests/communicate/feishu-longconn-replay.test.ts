@@ -495,6 +495,134 @@ test('feishu runtime atomically claims inbound text before handler completion', 
   }
 });
 
+test('feishu runtime keeps text watermark monotonic when same-thread messages complete out of order', async () => {
+  const runtimeModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-runtime.js');
+  const registryModulePath = path.resolve(__dirname, '../../src/communicate/storage/session-registry.js');
+  const longconnModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-longconn.js');
+  const serviceModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-service.js');
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-feishu-runtime-watermark-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+  const originalRegistryEnv = process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
+  const longconnModule = require(longconnModulePath) as {
+    createFeishuLongConnectionClient: (input: Record<string, unknown>) => { start: () => Promise<void>; stop: () => Promise<void> };
+  };
+  const serviceModule = require(serviceModulePath) as {
+    createFeishuService: (...args: Array<any>) => Record<string, unknown>;
+  };
+  const originalCreateLongConnectionClient = longconnModule.createFeishuLongConnectionClient;
+  const originalCreateFeishuService = serviceModule.createFeishuService;
+  const deferredByMessageId = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+  let runtime: { start: () => Promise<void>; stop: () => Promise<void> } | undefined;
+  let onTextMessage: ((message: Record<string, any>) => Promise<void>) | undefined;
+  const handledMessageIds: string[] = [];
+
+  try {
+    process.env.COMMUNICATE_SESSION_REGISTRY_PATH = registryPath;
+    longconnModule.createFeishuLongConnectionClient = (input: Record<string, any>) => {
+      onTextMessage = input.onTextMessage;
+      return {
+        start: async () => undefined,
+        stop: async () => undefined
+      };
+    };
+    serviceModule.createFeishuService = () => ({
+      handleInboundImage: async () => undefined,
+      handleInboundMessage: async (message: Record<string, any>) => {
+        handledMessageIds.push(message.messageId);
+        let deferred = deferredByMessageId.get(message.messageId);
+        if (!deferred) {
+          let resolve!: () => void;
+          const promise = new Promise<void>((innerResolve) => {
+            resolve = innerResolve;
+          });
+          deferred = { promise, resolve };
+          deferredByMessageId.set(message.messageId, deferred);
+        }
+        await deferred.promise;
+      },
+      handleCardAction: async () => undefined,
+      handleWorkerEvent: async () => undefined,
+      syncStartupCardForLastActiveThread: async () => undefined,
+      rememberInboundDeliveryTarget: () => undefined
+    });
+
+    delete require.cache[require.resolve(runtimeModulePath)];
+    delete require.cache[require.resolve(registryModulePath)];
+
+    const { createFeishuLongConnectionRuntime } = require(runtimeModulePath) as {
+      createFeishuLongConnectionRuntime: (input: Record<string, any>) => {
+        start: () => Promise<void>;
+        stop: () => Promise<void>;
+      };
+    };
+
+    runtime = createFeishuLongConnectionRuntime({
+      appId: 'app-id',
+      appSecret: 'app-secret',
+      codexCommand: ['codex'],
+      lease: { dirPath: path.join(rootDir, 'feishu-longconn.lease') }
+    });
+
+    await runtime.start();
+    assert.equal(typeof onTextMessage, 'function');
+
+    const olderDispatch = onTextMessage?.({
+      threadId: 'feishu:chat:oc_watermark_1',
+      text: '较老消息',
+      senderOpenId: 'ou_watermark_1',
+      eventId: 'evt_watermark_older',
+      messageId: 'om_text_watermark_older',
+      traceId: 'trace-watermark-older',
+      frameMessageId: 'msg-frame-watermark-older',
+      createTime: 1_710_001_000
+    });
+    await nextTick();
+
+    const newerDispatch = onTextMessage?.({
+      threadId: 'feishu:chat:oc_watermark_1',
+      text: '较新消息',
+      senderOpenId: 'ou_watermark_1',
+      eventId: 'evt_watermark_newer',
+      messageId: 'om_text_watermark_newer',
+      traceId: 'trace-watermark-newer',
+      frameMessageId: 'msg-frame-watermark-newer',
+      createTime: 1_710_002_000
+    });
+    await shortDelay();
+
+    assert.deepEqual(handledMessageIds, ['om_text_watermark_older', 'om_text_watermark_newer']);
+
+    deferredByMessageId.get('om_text_watermark_newer')?.resolve();
+    await newerDispatch;
+    deferredByMessageId.get('om_text_watermark_older')?.resolve();
+    await olderDispatch;
+
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+    assert.equal(
+      registry.getThreadUiState('feishu:chat:oc_watermark_1')?.lastAcceptedTextCreateTimeMs,
+      1_710_002_000_000
+    );
+  } finally {
+    for (const deferred of deferredByMessageId.values()) {
+      deferred.resolve();
+    }
+    if (runtime) {
+      await runtime.stop();
+    }
+    longconnModule.createFeishuLongConnectionClient = originalCreateLongConnectionClient;
+    serviceModule.createFeishuService = originalCreateFeishuService;
+    if (originalRegistryEnv === undefined) {
+      delete process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
+    } else {
+      process.env.COMMUNICATE_SESSION_REGISTRY_PATH = originalRegistryEnv;
+    }
+    delete require.cache[require.resolve(runtimeModulePath)];
+    delete require.cache[require.resolve(registryModulePath)];
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('feishu runtime backfills last active delivery target even when replayed text is deduped', async () => {
   const runtimeModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-runtime.js');
   const registryModulePath = path.resolve(__dirname, '../../src/communicate/storage/session-registry.js');
@@ -882,6 +1010,7 @@ test('feishu runtime suppresses stale inbound text when create_time is older tha
   const originalRegistryEnv = process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
   const originalDebugEnv = process.env.COMMUNICATE_FEISHU_DEBUG;
   const originalConsoleLog = console.log;
+  const originalDateNow = Date.now;
   const serviceModule = require(serviceModulePath) as {
     createFeishuService: (...args: Array<any>) => Record<string, unknown>;
   };
@@ -889,6 +1018,7 @@ test('feishu runtime suppresses stale inbound text when create_time is older tha
   const handledMessages: Array<Record<string, unknown>> = [];
   const logs: string[] = [];
   const seededCreateTimeMs = 1_710_001_000_000;
+  const runtimeStartMs = 1_710_001_500_000;
   let runtime: { start: () => Promise<void>; stop: () => Promise<void> } | undefined;
 
   try {
@@ -929,6 +1059,7 @@ test('feishu runtime suppresses stale inbound text when create_time is older tha
     console.log = (...args: unknown[]) => {
       logs.push(args.map((item) => String(item)).join(' '));
     };
+    Date.now = () => runtimeStartMs;
 
     let socket: MockWebSocket | undefined;
     runtime = createFeishuLongConnectionRuntime({
@@ -1011,6 +1142,7 @@ test('feishu runtime suppresses stale inbound text when create_time is older tha
     }
     serviceModule.createFeishuService = originalCreateFeishuService;
     console.log = originalConsoleLog;
+    Date.now = originalDateNow;
     if (originalRegistryEnv === undefined) {
       delete process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
     } else {
@@ -1027,6 +1159,483 @@ test('feishu runtime suppresses stale inbound text when create_time is older tha
   }
 });
 
+test('feishu runtime completes startup-stale replay even when create_time is older than thread watermark', async () => {
+  const runtimeModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-runtime.js');
+  const registryModulePath = path.resolve(__dirname, '../../src/communicate/storage/session-registry.js');
+  const frameModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-frame.js');
+  const serviceModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-service.js');
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-feishu-runtime-startup-stale-watermark-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+  const originalRegistryEnv = process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
+  const originalDebugEnv = process.env.COMMUNICATE_FEISHU_DEBUG;
+  const originalConsoleLog = console.log;
+  const originalDateNow = Date.now;
+  const serviceModule = require(serviceModulePath) as {
+    createFeishuService: (...args: Array<any>) => Record<string, unknown>;
+  };
+  const originalCreateFeishuService = serviceModule.createFeishuService;
+  const handledMessages: Array<Record<string, unknown>> = [];
+  const logs: string[] = [];
+  const seededCreateTimeMs = 1_710_002_000_000;
+  const runtimeStartMs = 1_710_006_000_000;
+  let runtime: { start: () => Promise<void>; stop: () => Promise<void> } | undefined;
+
+  try {
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+    registry.upsertThreadUiState({
+      feishuThreadId: 'feishu:chat:oc_startup_stale_watermark_1',
+      displayMode: 'assistant',
+      lastAcceptedTextCreateTimeMs: seededCreateTimeMs
+    });
+
+    process.env.COMMUNICATE_SESSION_REGISTRY_PATH = registryPath;
+    process.env.COMMUNICATE_FEISHU_DEBUG = '1';
+    serviceModule.createFeishuService = () => ({
+      handleInboundImage: async () => undefined,
+      handleInboundMessage: async (message: Record<string, unknown>) => {
+        handledMessages.push(message);
+      },
+      handleCardAction: async () => undefined,
+      handleWorkerEvent: async () => undefined,
+      syncStartupCardForLastActiveThread: async () => undefined,
+      rememberInboundDeliveryTarget: () => undefined
+    });
+
+    delete require.cache[require.resolve(runtimeModulePath)];
+    delete require.cache[require.resolve(registryModulePath)];
+
+    const { createFeishuLongConnectionRuntime } = require(runtimeModulePath) as {
+      createFeishuLongConnectionRuntime: (input: Record<string, any>) => {
+        start: () => Promise<void>;
+        stop: () => Promise<void>;
+      };
+    };
+    const { encodeFeishuFrame } = require(frameModulePath) as {
+      encodeFeishuFrame: (frame: Record<string, unknown>) => Uint8Array;
+    };
+
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((item) => String(item)).join(' '));
+    };
+    Date.now = () => runtimeStartMs;
+
+    let socket: MockWebSocket | undefined;
+    runtime = createFeishuLongConnectionRuntime({
+      appId: 'app-id',
+      appSecret: 'app-secret',
+      codexCommand: ['codex'],
+      lease: { dirPath: path.join(rootDir, 'feishu-longconn.lease') },
+      fetchImpl: async (): Promise<Response> =>
+        new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              URL: 'wss://example.test/ws?device_id=device-startup-stale-watermark&service_id=321',
+              ClientConfig: {
+                PingInterval: 30,
+                ReconnectCount: 0,
+                ReconnectInterval: 5,
+                ReconnectNonce: 0
+              }
+            }
+          }),
+          { status: 200 }
+        ),
+      createWebSocket: (url: string) => {
+        socket = new MockWebSocket(url);
+        return socket;
+      }
+    });
+
+    await runtime.start();
+    await nextTick();
+
+    socket?.emitMessage(encodeFeishuFrame({
+      SeqID: 1n,
+      LogID: 2n,
+      service: 321,
+      method: 1,
+      headers: [
+        { key: 'type', value: 'event' },
+        { key: 'message_id', value: 'msg-frame-startup-stale-watermark-1' },
+        { key: 'trace_id', value: 'trace-startup-stale-watermark-1' }
+      ],
+      payload: new TextEncoder().encode(JSON.stringify({
+        schema: '2.0',
+        header: {
+          event_id: 'evt_startup_stale_watermark_1',
+          event_type: 'im.message.receive_v1'
+        },
+        event: {
+          sender: {
+            sender_id: {
+              open_id: 'ou_startup_stale_watermark_1'
+            }
+          },
+          message: {
+            chat_id: 'oc_startup_stale_watermark_1',
+            message_id: 'om_text_startup_stale_watermark_1',
+            message_type: 'text',
+            create_time: '1710001000',
+            content: JSON.stringify({ text: '更老的重启回放消息' })
+          }
+        }
+      }))
+    }));
+    await shortDelay();
+
+    assert.equal(handledMessages.length, 0);
+    const staleLog = logs.find((entry) => entry.includes('[feishu-runtime] inbound startup stale ignored'));
+    assert.ok(staleLog, 'expected feishu runtime startup stale log');
+    assert.match(staleLog ?? '', /"messageId":"om_text_startup_stale_watermark_1"/);
+    assert.match(staleLog ?? '', /"incomingCreateTimeMs":1710001000000/);
+    assert.match(staleLog ?? '', /"lastAcceptedTextCreateTimeMs":1710002000000/);
+
+    const reloadedRegistry = createSessionRegistry({ registryPath });
+    assert.equal(
+      reloadedRegistry.getThreadUiState('feishu:chat:oc_startup_stale_watermark_1')?.lastAcceptedTextCreateTimeMs,
+      seededCreateTimeMs
+    );
+    assert.equal(typeof reloadedRegistry.getInboundMessages().om_text_startup_stale_watermark_1, 'number');
+  } finally {
+    if (runtime) {
+      await runtime.stop();
+    }
+    serviceModule.createFeishuService = originalCreateFeishuService;
+    console.log = originalConsoleLog;
+    Date.now = originalDateNow;
+    if (originalRegistryEnv === undefined) {
+      delete process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
+    } else {
+      process.env.COMMUNICATE_SESSION_REGISTRY_PATH = originalRegistryEnv;
+    }
+    if (originalDebugEnv === undefined) {
+      delete process.env.COMMUNICATE_FEISHU_DEBUG;
+    } else {
+      process.env.COMMUNICATE_FEISHU_DEBUG = originalDebugEnv;
+    }
+    delete require.cache[require.resolve(runtimeModulePath)];
+    delete require.cache[require.resolve(registryModulePath)];
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('feishu runtime accepts startup-replayed inbound text not older than startup watermark', async () => {
+  const runtimeModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-runtime.js');
+  const registryModulePath = path.resolve(__dirname, '../../src/communicate/storage/session-registry.js');
+  const frameModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-frame.js');
+  const serviceModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-service.js');
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-feishu-runtime-startup-stale-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+  const originalRegistryEnv = process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
+  const originalDebugEnv = process.env.COMMUNICATE_FEISHU_DEBUG;
+  const originalConsoleLog = console.log;
+  const originalDateNow = Date.now;
+  const serviceModule = require(serviceModulePath) as {
+    createFeishuService: (...args: Array<any>) => Record<string, unknown>;
+  };
+  const originalCreateFeishuService = serviceModule.createFeishuService;
+  const handledMessages: Array<Record<string, unknown>> = [];
+  const logs: string[] = [];
+  const seededCreateTimeMs = 1_710_000_000_000;
+  const runtimeStartMs = 1_710_006_000_000;
+  let runtime: { start: () => Promise<void>; stop: () => Promise<void> } | undefined;
+
+  try {
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+    registry.upsertThreadUiState({
+      feishuThreadId: 'feishu:chat:oc_startup_stale_1',
+      displayMode: 'assistant',
+      lastAcceptedTextCreateTimeMs: seededCreateTimeMs
+    });
+
+    process.env.COMMUNICATE_SESSION_REGISTRY_PATH = registryPath;
+    process.env.COMMUNICATE_FEISHU_DEBUG = '1';
+    serviceModule.createFeishuService = () => ({
+      handleInboundImage: async () => undefined,
+      handleInboundMessage: async (message: Record<string, unknown>) => {
+        handledMessages.push(message);
+      },
+      handleCardAction: async () => undefined,
+      handleWorkerEvent: async () => undefined,
+      syncStartupCardForLastActiveThread: async () => undefined,
+      rememberInboundDeliveryTarget: () => undefined
+    });
+
+    delete require.cache[require.resolve(runtimeModulePath)];
+    delete require.cache[require.resolve(registryModulePath)];
+
+    const { createFeishuLongConnectionRuntime } = require(runtimeModulePath) as {
+      createFeishuLongConnectionRuntime: (input: Record<string, any>) => {
+        start: () => Promise<void>;
+        stop: () => Promise<void>;
+      };
+    };
+    const { encodeFeishuFrame } = require(frameModulePath) as {
+      encodeFeishuFrame: (frame: Record<string, unknown>) => Uint8Array;
+    };
+
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((item) => String(item)).join(' '));
+    };
+    Date.now = () => runtimeStartMs;
+
+    let socket: MockWebSocket | undefined;
+    runtime = createFeishuLongConnectionRuntime({
+      appId: 'app-id',
+      appSecret: 'app-secret',
+      codexCommand: ['codex'],
+      lease: { dirPath: path.join(rootDir, 'feishu-longconn.lease') },
+      fetchImpl: async (): Promise<Response> =>
+        new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              URL: 'wss://example.test/ws?device_id=device-startup-stale&service_id=321',
+              ClientConfig: {
+                PingInterval: 30,
+                ReconnectCount: 0,
+                ReconnectInterval: 5,
+                ReconnectNonce: 0
+              }
+            }
+          }),
+          { status: 200 }
+        ),
+      createWebSocket: (url: string) => {
+        socket = new MockWebSocket(url);
+        return socket;
+      }
+    });
+
+    await runtime.start();
+    await nextTick();
+
+    socket?.emitMessage(encodeFeishuFrame({
+      SeqID: 1n,
+      LogID: 2n,
+      service: 321,
+      method: 1,
+      headers: [
+        { key: 'type', value: 'event' },
+        { key: 'message_id', value: 'msg-frame-startup-stale-1' },
+        { key: 'trace_id', value: 'trace-startup-stale-1' }
+      ],
+      payload: new TextEncoder().encode(JSON.stringify({
+        schema: '2.0',
+        header: {
+          event_id: 'evt_startup_stale_1',
+          event_type: 'im.message.receive_v1'
+        },
+        event: {
+          sender: {
+            sender_id: {
+              open_id: 'ou_startup_stale_1'
+            }
+          },
+          message: {
+            chat_id: 'oc_startup_stale_1',
+            message_id: 'om_text_startup_stale_1',
+            message_type: 'text',
+            create_time: '1710001000',
+            content: JSON.stringify({ text: '停机期间的新消息' })
+          }
+        }
+      }))
+    }));
+    await shortDelay();
+
+    socket?.emitMessage(encodeFeishuFrame({
+      SeqID: 2n,
+      LogID: 3n,
+      service: 321,
+      method: 1,
+      headers: [
+        { key: 'type', value: 'event' },
+        { key: 'message_id', value: 'msg-frame-startup-stale-same-ts' },
+        { key: 'trace_id', value: 'trace-startup-stale-same-ts' }
+      ],
+      payload: new TextEncoder().encode(JSON.stringify({
+        schema: '2.0',
+        header: {
+          event_id: 'evt_startup_stale_same_ts',
+          event_type: 'im.message.receive_v1'
+        },
+        event: {
+          sender: {
+            sender_id: {
+              open_id: 'ou_startup_stale_1'
+            }
+          },
+          message: {
+            chat_id: 'oc_startup_stale_1',
+            message_id: 'om_text_startup_stale_same_ts',
+            message_type: 'text',
+            create_time: '1710000000',
+            content: JSON.stringify({ text: '同秒停机期间的新消息' })
+          }
+        }
+      }))
+    }));
+    await shortDelay();
+
+    assert.equal(handledMessages.length, 2);
+    assert.equal(handledMessages[0]?.messageId, 'om_text_startup_stale_1');
+    assert.equal(handledMessages[1]?.messageId, 'om_text_startup_stale_same_ts');
+    const staleLog = logs.find((entry) => entry.includes('[feishu-runtime] inbound startup stale ignored'));
+    assert.equal(staleLog, undefined);
+
+    const reloadedRegistry = createSessionRegistry({ registryPath });
+    assert.equal(
+      reloadedRegistry.getThreadUiState('feishu:chat:oc_startup_stale_1')?.lastAcceptedTextCreateTimeMs,
+      1_710_001_000_000
+    );
+    assert.equal(typeof reloadedRegistry.getInboundMessages().om_text_startup_stale_1, 'number');
+    assert.equal(typeof reloadedRegistry.getInboundMessages().om_text_startup_stale_same_ts, 'number');
+  } finally {
+    if (runtime) {
+      await runtime.stop();
+    }
+    serviceModule.createFeishuService = originalCreateFeishuService;
+    console.log = originalConsoleLog;
+    Date.now = originalDateNow;
+    if (originalRegistryEnv === undefined) {
+      delete process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
+    } else {
+      process.env.COMMUNICATE_SESSION_REGISTRY_PATH = originalRegistryEnv;
+    }
+    if (originalDebugEnv === undefined) {
+      delete process.env.COMMUNICATE_FEISHU_DEBUG;
+    } else {
+      process.env.COMMUNICATE_FEISHU_DEBUG = originalDebugEnv;
+    }
+    delete require.cache[require.resolve(runtimeModulePath)];
+    delete require.cache[require.resolve(registryModulePath)];
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('feishu runtime accepts out-of-order startup replay newer than startup watermark even with clock skew', async () => {
+  const runtimeModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-runtime.js');
+  const registryModulePath = path.resolve(__dirname, '../../src/communicate/storage/session-registry.js');
+  const longconnModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-longconn.js');
+  const serviceModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-service.js');
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-feishu-runtime-startup-out-of-order-'));
+  const registryPath = path.join(rootDir, 'registry.json');
+  const originalRegistryEnv = process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
+  const originalDateNow = Date.now;
+  const longconnModule = require(longconnModulePath) as {
+    createFeishuLongConnectionClient: (input: Record<string, unknown>) => { start: () => Promise<void>; stop: () => Promise<void> };
+  };
+  const serviceModule = require(serviceModulePath) as {
+    createFeishuService: (...args: Array<any>) => Record<string, unknown>;
+  };
+  const originalCreateLongConnectionClient = longconnModule.createFeishuLongConnectionClient;
+  const originalCreateFeishuService = serviceModule.createFeishuService;
+  const handledMessageIds: string[] = [];
+  const seededCreateTimeMs = 1_710_000_000_000;
+  const runtimeStartMs = 1_710_000_500_000;
+  let runtime: { start: () => Promise<void>; stop: () => Promise<void> } | undefined;
+  let onTextMessage: ((message: Record<string, any>) => Promise<void>) | undefined;
+
+  try {
+    const { createSessionRegistry } = loadSessionRegistryModule();
+    const registry = createSessionRegistry({ registryPath });
+    registry.upsertThreadUiState({
+      feishuThreadId: 'feishu:chat:oc_startup_out_of_order_1',
+      displayMode: 'assistant',
+      lastAcceptedTextCreateTimeMs: seededCreateTimeMs
+    });
+
+    process.env.COMMUNICATE_SESSION_REGISTRY_PATH = registryPath;
+    Date.now = () => runtimeStartMs;
+    longconnModule.createFeishuLongConnectionClient = (input: Record<string, any>) => {
+      onTextMessage = input.onTextMessage;
+      return {
+        start: async () => undefined,
+        stop: async () => undefined
+      };
+    };
+    serviceModule.createFeishuService = () => ({
+      handleInboundImage: async () => undefined,
+      handleInboundMessage: async (message: Record<string, any>) => {
+        handledMessageIds.push(message.messageId);
+      },
+      handleCardAction: async () => undefined,
+      handleWorkerEvent: async () => undefined,
+      syncStartupCardForLastActiveThread: async () => undefined,
+      rememberInboundDeliveryTarget: () => undefined
+    });
+
+    delete require.cache[require.resolve(runtimeModulePath)];
+    delete require.cache[require.resolve(registryModulePath)];
+
+    const { createFeishuLongConnectionRuntime } = require(runtimeModulePath) as {
+      createFeishuLongConnectionRuntime: (input: Record<string, any>) => {
+        start: () => Promise<void>;
+        stop: () => Promise<void>;
+      };
+    };
+
+    runtime = createFeishuLongConnectionRuntime({
+      appId: 'app-id',
+      appSecret: 'app-secret',
+      codexCommand: ['codex'],
+      lease: { dirPath: path.join(rootDir, 'feishu-longconn.lease') }
+    });
+
+    await runtime.start();
+    assert.equal(typeof onTextMessage, 'function');
+
+    await onTextMessage?.({
+      threadId: 'feishu:chat:oc_startup_out_of_order_1',
+      text: '停机期间较新的消息',
+      senderOpenId: 'ou_startup_out_of_order_1',
+      eventId: 'evt_startup_out_of_order_newer',
+      messageId: 'om_text_startup_out_of_order_newer',
+      traceId: 'trace-startup-out-of-order-newer',
+      frameMessageId: 'msg-frame-startup-out-of-order-newer',
+      createTime: 1_710_002_000
+    });
+    await onTextMessage?.({
+      threadId: 'feishu:chat:oc_startup_out_of_order_1',
+      text: '停机期间较早但未处理的消息',
+      senderOpenId: 'ou_startup_out_of_order_1',
+      eventId: 'evt_startup_out_of_order_older',
+      messageId: 'om_text_startup_out_of_order_older',
+      traceId: 'trace-startup-out-of-order-older',
+      frameMessageId: 'msg-frame-startup-out-of-order-older',
+      createTime: 1_710_001_000
+    });
+
+    assert.deepEqual(handledMessageIds, [
+      'om_text_startup_out_of_order_newer',
+      'om_text_startup_out_of_order_older'
+    ]);
+    assert.equal(
+      createSessionRegistry({ registryPath }).getThreadUiState('feishu:chat:oc_startup_out_of_order_1')?.lastAcceptedTextCreateTimeMs,
+      1_710_002_000_000
+    );
+  } finally {
+    if (runtime) {
+      await runtime.stop();
+    }
+    longconnModule.createFeishuLongConnectionClient = originalCreateLongConnectionClient;
+    serviceModule.createFeishuService = originalCreateFeishuService;
+    Date.now = originalDateNow;
+    if (originalRegistryEnv === undefined) {
+      delete process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
+    } else {
+      process.env.COMMUNICATE_SESSION_REGISTRY_PATH = originalRegistryEnv;
+    }
+    delete require.cache[require.resolve(runtimeModulePath)];
+    delete require.cache[require.resolve(registryModulePath)];
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('feishu runtime persists accepted text watermark and suppresses older text after restart', async () => {
   const runtimeModulePath = path.resolve(__dirname, '../../src/communicate/channel/feishu-runtime.js');
   const registryModulePath = path.resolve(__dirname, '../../src/communicate/storage/session-registry.js');
@@ -1035,18 +1644,23 @@ test('feishu runtime persists accepted text watermark and suppresses older text 
   const rootDir = mkdtempSync(path.join(os.tmpdir(), 'communicate-feishu-runtime-stale-restart-'));
   const registryPath = path.join(rootDir, 'registry.json');
   const originalRegistryEnv = process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
+  const originalDateNow = Date.now;
   const serviceModule = require(serviceModulePath) as {
     createFeishuService: (...args: Array<any>) => Record<string, unknown>;
   };
   const originalCreateFeishuService = serviceModule.createFeishuService;
   const firstHandledMessages: Array<Record<string, unknown>> = [];
   const secondHandledMessages: Array<Record<string, unknown>> = [];
+  const firstRuntimeStartMs = 1_710_001_200_000;
+  const secondRuntimeStartMs = 1_710_001_500_000;
+  let nowMs = firstRuntimeStartMs;
   let activeHandledMessages = firstHandledMessages;
   let firstRuntime: { start: () => Promise<void>; stop: () => Promise<void> } | undefined;
   let secondRuntime: { start: () => Promise<void>; stop: () => Promise<void> } | undefined;
 
   try {
     process.env.COMMUNICATE_SESSION_REGISTRY_PATH = registryPath;
+    Date.now = () => nowMs;
     serviceModule.createFeishuService = () => ({
       handleInboundImage: async () => undefined,
       handleInboundMessage: async (message: Record<string, unknown>) => {
@@ -1147,6 +1761,7 @@ test('feishu runtime persists accepted text watermark and suppresses older text 
     await firstRuntime.stop();
     firstRuntime = undefined;
     activeHandledMessages = secondHandledMessages;
+    nowMs = secondRuntimeStartMs;
 
     delete require.cache[require.resolve(runtimeModulePath)];
     delete require.cache[require.resolve(registryModulePath)];
@@ -1237,6 +1852,7 @@ test('feishu runtime persists accepted text watermark and suppresses older text 
       await secondRuntime.stop();
     }
     serviceModule.createFeishuService = originalCreateFeishuService;
+    Date.now = originalDateNow;
     if (originalRegistryEnv === undefined) {
       delete process.env.COMMUNICATE_SESSION_REGISTRY_PATH;
     } else {

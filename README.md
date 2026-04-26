@@ -51,7 +51,7 @@ English summary: [README.en.md](./README.en.md)
 4. 需要时直接接管已有任务
 5. 在同一个线程里把本机工作持续推进
 
-如果你是第一次接触这个项目，建议优先阅读后面的“推荐首启安装器”与“初次评估路径”。
+如果你是第一次接触这个项目，建议先看后面的“推荐首启安装器”；只有当你准备从源码仓库评估、开发或排障时，再进入“初次评估路径”。
 
 ## 飞书常用操作：项目卡
 
@@ -72,7 +72,9 @@ English summary: [README.en.md](./README.en.md)
 
 可以把它理解成“把当前状态卡重新发到底部”的快捷口令。
 
-## 环境要求
+## 源码 / 手动路径环境要求
+
+如果你走 EXE 安装器的普通下载用户路径，可以先跳过这一节；下面这些前置条件主要适用于源码构建、手动排障和开发者路径。
 
 - Windows
 - PowerShell
@@ -82,7 +84,7 @@ English summary: [README.en.md](./README.en.md)
 
 ## 飞书开放平台最小配置
 
-安装器可以帮你装 Node.js、Codex CLI 和本地依赖，但不会替你自动完成飞书开放平台里的应用配置。
+源码路径下的仓库安装器可以帮你装 Node.js、Codex CLI 和本地依赖，但不会替你自动完成飞书开放平台里的应用配置；如果你是普通下载用户，请优先看 EXE 安装器路径，不必把这些当成全局前置条件。
 
 如果你是第一次接触飞书开放平台，至少先完成下面这些前置项，再回来执行安装器或手动启动：
 
@@ -98,13 +100,49 @@ English summary: [README.en.md](./README.en.md)
 
 ## 推荐首启安装器
 
-如果你是第一次接触这个项目，建议优先使用仓库根目录的 `Install-CodexLark.ps1`，而不是直接手动逐步配置。
+### 产品安装方向
+
+- 未来面向普通下载用户的主路径会收敛为 EXE 安装器 + 首次启动向导。
+- 当前仓库里的 PowerShell 安装脚本会继续保留，但定位为源码构建、开发调试和手动排障路径，而不是长期面向普通用户的主安装入口。
+
+推荐先按身份看文档：
+
+- 普通下载用户：看 [`docs/workflows/product-installer.md`](./docs/workflows/product-installer.md)
+- 源码 / 开发者 / 发布维护者：继续看本节、下方“快速开始”和 [`docs/workflows/product-installer-release-gates.md`](./docs/workflows/product-installer-release-gates.md)
+
+如果你是在维护发布流程、准备给普通用户打 EXE 安装包，请先完成本地构建并确认 `Get-Command npm`、`Get-Command node`、`Get-Command iscc` 都可用，然后运行：
+
+```powershell
+npm run build
+powershell -ExecutionPolicy Bypass -File .\scripts\package\build-installer.ps1
+```
+
+如果你想按固定顺序做一轮“构建 + 测试 + 打包 + 干净机器验证”的发布 dry-run，可以直接看 [`docs/workflows/product-installer-release-dry-run.md`](./docs/workflows/product-installer-release-dry-run.md) 并运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package\run-product-installer-release-dry-run.ps1
+```
+
+预期结果：
+
+- 在 `artifacts\packaging\output\` 生成 `CodexLark-Setup-<version>.exe`
+- 安装包内置 `node.exe`、预编译 `dist\`、启动/修复入口与 PowerShell bridge 脚本
+- 安装完成后会先同步 runtime manifest，再以原桌面用户身份触发 `first-run`
+
+打包说明：
+
+- `scripts\package\build-installer.ps1` 会把 staging/output 目录限制在 `artifacts\packaging\` 下，避免误删其他目录
+- 默认会通过当前 Node 的真实 `process.execPath` 解析要内置的 `node.exe`
+- 如果你的开发机用了 Volta / nvs / 其他 shim 管理器，且你想显式指定打包进去的 Node，可传 `-BundledNodePath <node.exe 全路径>`
+
+如果你是从源码仓库开始评估、调试或维护这个项目，建议优先使用仓库根目录的 `Install-CodexLark.ps1`，而不是直接手动逐步配置。
 
 适用范围：
 
 - 普通个人 Windows 10/11 电脑
 - 可联网
 - 已安装 `winget`
+- PowerShell 主机为 Windows PowerShell 5.1 或 PowerShell 7，且语言模式为 `FullLanguage`
 - 允许管理员提权
 - 已按你的飞书开放平台配置流程准备好 App ID / App Secret
 
@@ -126,8 +164,24 @@ powershell -ExecutionPolicy Bypass -File .\Install-CodexLark.ps1
 说明：
 
 - 如果机器缺少 `winget`，安装器会直接告警退出；首版不提供无 `winget` 兜底
+- 当前 host contract 只会对可检测的主机前置条件统一 fail-fast，例如非 Windows、`ConstrainedLanguage` / `RestrictedLanguage`，以及自启动脚本缺少 ScheduledTasks 支持；AppLocker / WDAC / ExecutionPolicy / 杀毒 / 代理等阻断如果只在后续命令里显现，仍可能在具体操作点报原生错误，届时请根据日志路径改走手动 fallback
 - 安装完成后，是否立即启动飞书长连接由你自己确认
+- 详细支持边界、受支持 PowerShell 版本与常见企业阻断见 [`docs/workflows/install-startup-support-matrix.md`](./docs/workflows/install-startup-support-matrix.md)
 - 下方“快速开始”仍然保留，适合手动安装、排障或二次开发场景
+
+### 安装器 / 手动路径怎么选
+
+优先使用安装器的情况：
+
+- 你在个人 Windows 10/11 电脑上，允许管理员提权
+- 当前 PowerShell 是 `FullLanguage`，并且 `winget`、网络访问未被企业策略封锁；如果你还打算启用计划任务自启动，再额外确认 ScheduledTasks 没被禁用
+- 你希望一次性完成 Node.js、Codex CLI、构建、doctor 和后续启动入口的准备
+
+优先走手动路径（见下方“快速开始”）的情况：
+
+- 当前机器没有 `winget`，或公司代理 / 杀毒 / EDR 会拦截 `winget`、`npm install`、`Start-Process`
+- 当前 PowerShell 是 `ConstrainedLanguage`，或者你预期 ExecutionPolicy / AppLocker / WDAC / 杀毒 / 代理 会在后续命令阶段拦截安装步骤
+- 你只想做本地评估、排障或二次开发，不希望安装器修改本机环境
 
 ## 初次评估路径
 
@@ -233,6 +287,7 @@ node .\dist\agent-cli.js feishu-webhook --feishuAppId $env:FEISHU_APP_ID
 
 - 任务仍然复用现有 `run-admin-task.ps1` 管理日志、PID 和管理员启动链路
 - 安装/卸载脚本会请求管理员授权，请先自行阅读脚本内容再执行
+- 自启动安装/卸载脚本会在检测到缺少 ScheduledTasks 支持或受限语言模式时尽早退出；如果企业策略是在 `Register-ScheduledTask` 或后续提权/启动阶段才拦截，仍可能在对应操作点报原生错误。安装器本身不会因为计划任务缺失而整体 fail-fast；请先看支持矩阵，再决定是否改走手动路径
 
 安装：
 

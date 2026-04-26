@@ -105,3 +105,119 @@ test('parseFeishuCardActionEvent preserves assistant receipt card source and tur
     turnId: 'turn-7'
   });
 });
+
+test('parseFeishuCardActionEvent recognizes open_takeover_picker', () => {
+  const action = parseFeishuCardActionEvent({
+    header: { event_type: 'card.action.trigger' },
+    event: {
+      context: {
+        open_chat_id: 'oc_test_chat_4',
+        open_message_id: 'om_takeover_1'
+      },
+      action: {
+        value: {
+          kind: 'open_takeover_picker'
+        }
+      }
+    }
+  });
+
+  assert.deepEqual(action, {
+    threadId: 'feishu:chat:oc_test_chat_4',
+    messageId: 'om_takeover_1',
+    kind: 'open_takeover_picker'
+  });
+});
+
+test('parseFeishuCardActionEvent recognizes pick_takeover_task with task id', () => {
+  const action = parseFeishuCardActionEvent({
+    header: { event_type: 'card.action.trigger' },
+    event: {
+      context: {
+        open_chat_id: 'oc_test_chat_5',
+        open_message_id: 'om_takeover_2'
+      },
+      action: {
+        value: {
+          kind: 'pick_takeover_task',
+          taskId: 'T42'
+        }
+      }
+    }
+  });
+
+  assert.deepEqual(action, {
+    threadId: 'feishu:chat:oc_test_chat_5',
+    messageId: 'om_takeover_2',
+    kind: 'pick_takeover_task',
+    taskId: 'T42'
+  });
+});
+
+test('parseFeishuCardActionEvent recognizes return_to_status', () => {
+  const action = parseFeishuCardActionEvent({
+    header: { event_type: 'card.action.trigger' },
+    event: {
+      context: {
+        open_chat_id: 'oc_test_chat_6',
+        open_message_id: 'om_takeover_3'
+      },
+      action: {
+        value: JSON.stringify({
+          kind: 'return_to_status'
+        })
+      }
+    }
+  });
+
+  assert.deepEqual(action, {
+    threadId: 'feishu:chat:oc_test_chat_6',
+    messageId: 'om_takeover_3',
+    kind: 'return_to_status'
+  });
+});
+
+test('parseFeishuCardActionEvent rejects pick_takeover_task with invalid task id', () => {
+  const action = parseFeishuCardActionEvent({
+    header: { event_type: 'card.action.trigger' },
+    event: {
+      context: {
+        open_chat_id: 'oc_test_chat_7',
+        open_message_id: 'om_takeover_4'
+      },
+      action: {
+        value: {
+          kind: 'pick_takeover_task',
+          taskId: 'bad-id'
+        }
+      }
+    }
+  });
+
+  assert.equal(action, null);
+});
+
+test('parseFeishuCardActionEvent preserves JSON string callback payload for takeover actions', () => {
+  const action = parseFeishuCardActionEvent({
+    header: { event_type: 'card.action.trigger' },
+    event: {
+      context: {
+        chat_id: 'oc_test_chat_8',
+        message_id: 'om_takeover_5'
+      },
+      action: {
+        value: JSON.stringify({
+          kind: 'pick_takeover_task',
+          taskId: 'T77'
+        })
+      }
+    }
+  });
+
+  assert.deepEqual(action, {
+    threadId: 'feishu:chat:oc_test_chat_8',
+    messageId: 'om_takeover_5',
+    kind: 'pick_takeover_task',
+    taskId: 'T77'
+  });
+});

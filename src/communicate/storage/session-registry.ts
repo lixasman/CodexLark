@@ -64,12 +64,13 @@ export type SessionThreadBindingRecord = {
 };
 
 export type SessionThreadUiMode = 'assistant' | 'coding';
+export type SessionThreadStatusCardMode = 'status' | 'launcher' | 'takeover_picker';
 
 export type SessionThreadUiStateRecord = {
   feishuThreadId: string;
   displayMode: SessionThreadUiMode;
   lastAcceptedTextCreateTimeMs?: number;
-  statusCardMode?: 'status' | 'launcher';
+  statusCardMode?: SessionThreadStatusCardMode;
   currentCodingTaskId?: CommunicateTaskId;
   statusCardMessageId?: string;
   statusCardActionMessageId?: string;
@@ -77,6 +78,12 @@ export type SessionThreadUiStateRecord = {
   launcherSelectedCwd?: string;
   launcherDraftCwd?: string;
   launcherError?: string;
+  takeoverPickerTaskIds?: CommunicateTaskId[];
+  takeoverPickerPage?: number;
+  takeoverPickerTotalPages?: number;
+  takeoverPickerSelectedTaskId?: CommunicateTaskId;
+  takeoverPickerSnapshotUpdatedAt?: string;
+  takeoverPickerError?: string;
 };
 
 export type SessionRegistryState = {
@@ -153,7 +160,13 @@ function cloneThreadBinding(record: SessionThreadBindingRecord): SessionThreadBi
 }
 
 function cloneThreadUiState(record: SessionThreadUiStateRecord): SessionThreadUiStateRecord {
-  return { ...record };
+  if (!record.takeoverPickerTaskIds) {
+    return { ...record };
+  }
+  return {
+    ...record,
+    takeoverPickerTaskIds: [...record.takeoverPickerTaskIds]
+  };
 }
 
 function cloneState(state: SessionRegistryState): SessionRegistryState {
@@ -184,6 +197,36 @@ function cloneState(state: SessionRegistryState): SessionRegistryState {
 function normalizeInboundMessageSeenAt(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined;
   return Math.floor(value);
+}
+
+function normalizeCommunicateTaskId(value: unknown): CommunicateTaskId | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return /^T\d+$/.test(trimmed) ? (trimmed as CommunicateTaskId) : undefined;
+}
+
+function normalizeTakeoverPickerTaskIds(value: unknown): CommunicateTaskId[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const normalized: CommunicateTaskId[] = [];
+  const seen = new Set<CommunicateTaskId>();
+  for (const item of value) {
+    const taskId = normalizeCommunicateTaskId(item);
+    if (!taskId || seen.has(taskId)) continue;
+    seen.add(taskId);
+    normalized.push(taskId);
+  }
+  return normalized;
+}
+
+function normalizeNonNegativeInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) return undefined;
+  return value;
+}
+
+function normalizeOptionalTrimmedString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 function normalizeRecentProjectDirs(value: unknown): string[] {
@@ -316,21 +359,19 @@ function normalizeState(raw: unknown): SessionRegistryState {
       if (!value || typeof value !== 'object') continue;
       const displayMode = (value as { displayMode?: unknown }).displayMode;
       if (displayMode !== 'assistant' && displayMode !== 'coding') continue;
-      const currentCodingTaskId = typeof (value as { currentCodingTaskId?: unknown }).currentCodingTaskId === 'string'
-        ? (value as { currentCodingTaskId: string }).currentCodingTaskId
-        : undefined;
+      const currentCodingTaskId = normalizeCommunicateTaskId(
+        (value as { currentCodingTaskId?: unknown }).currentCodingTaskId
+      );
       const nextRecord: SessionThreadUiStateRecord = {
         feishuThreadId,
         displayMode
       };
-      if (
-        (value as { statusCardMode?: unknown }).statusCardMode === 'status' ||
-        (value as { statusCardMode?: unknown }).statusCardMode === 'launcher'
-      ) {
-        nextRecord.statusCardMode = (value as { statusCardMode: 'status' | 'launcher' }).statusCardMode;
+      const statusCardMode = (value as { statusCardMode?: unknown }).statusCardMode;
+      if (statusCardMode === 'status' || statusCardMode === 'launcher' || statusCardMode === 'takeover_picker') {
+        nextRecord.statusCardMode = statusCardMode;
       }
-      if (currentCodingTaskId && /^T\d+$/.test(currentCodingTaskId)) {
-        nextRecord.currentCodingTaskId = currentCodingTaskId as CommunicateTaskId;
+      if (currentCodingTaskId) {
+        nextRecord.currentCodingTaskId = currentCodingTaskId;
       }
       if (typeof (value as { statusCardMessageId?: unknown }).statusCardMessageId === 'string') {
         nextRecord.statusCardMessageId = (value as { statusCardMessageId: string }).statusCardMessageId;
@@ -361,6 +402,42 @@ function normalizeState(raw: unknown): SessionRegistryState {
         if (launcherError) {
           nextRecord.launcherError = launcherError;
         }
+      }
+      const takeoverPickerTaskIds = normalizeTakeoverPickerTaskIds(
+        (value as { takeoverPickerTaskIds?: unknown }).takeoverPickerTaskIds
+      );
+      if (takeoverPickerTaskIds !== undefined) {
+        nextRecord.takeoverPickerTaskIds = takeoverPickerTaskIds;
+      }
+      const takeoverPickerPage = normalizeNonNegativeInteger(
+        (value as { takeoverPickerPage?: unknown }).takeoverPickerPage
+      );
+      if (takeoverPickerPage !== undefined) {
+        nextRecord.takeoverPickerPage = takeoverPickerPage;
+      }
+      const takeoverPickerTotalPages = normalizeNonNegativeInteger(
+        (value as { takeoverPickerTotalPages?: unknown }).takeoverPickerTotalPages
+      );
+      if (takeoverPickerTotalPages !== undefined) {
+        nextRecord.takeoverPickerTotalPages = Math.max(1, takeoverPickerTotalPages);
+      }
+      const takeoverPickerSelectedTaskId = normalizeCommunicateTaskId(
+        (value as { takeoverPickerSelectedTaskId?: unknown }).takeoverPickerSelectedTaskId
+      );
+      if (takeoverPickerSelectedTaskId) {
+        nextRecord.takeoverPickerSelectedTaskId = takeoverPickerSelectedTaskId;
+      }
+      const takeoverPickerSnapshotUpdatedAt = normalizeOptionalTrimmedString(
+        (value as { takeoverPickerSnapshotUpdatedAt?: unknown }).takeoverPickerSnapshotUpdatedAt
+      );
+      if (takeoverPickerSnapshotUpdatedAt) {
+        nextRecord.takeoverPickerSnapshotUpdatedAt = takeoverPickerSnapshotUpdatedAt;
+      }
+      const takeoverPickerError = normalizeOptionalTrimmedString(
+        (value as { takeoverPickerError?: unknown }).takeoverPickerError
+      );
+      if (takeoverPickerError) {
+        nextRecord.takeoverPickerError = takeoverPickerError;
       }
       const lastAcceptedTextCreateTimeMs = normalizeInboundMessageSeenAt(
         (value as { lastAcceptedTextCreateTimeMs?: unknown }).lastAcceptedTextCreateTimeMs

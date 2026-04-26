@@ -63,6 +63,19 @@ test('routes takeover command with explicit task id', () => {
   assert.equal(routed.taskId, 'T1');
 });
 
+test('does not route takeover capability questions as takeover commands', () => {
+  const routed = routeUserMessage({
+    text: '目前这个项目是具备接管本地codex项目的能力吗？',
+    threadId: 'feishu:chat-1',
+    waitingTasks: []
+  });
+
+  assert.equal(routed.intent, 'start_task');
+  assert.equal(routed.taskType, 'chat_reply');
+  assert.equal(routed.reason, 'default_chat_reply');
+  assert.equal(routed.params.message, '目前这个项目是具备接管本地codex项目的能力吗？');
+});
+
 test('routes explicit task replies for choice and text input', () => {
   const choice = routeUserMessage({
     text: '对 T2 选择第一个',

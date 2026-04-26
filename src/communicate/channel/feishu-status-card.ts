@@ -8,7 +8,7 @@ import {
 } from '../protocol/task-types';
 
 export type FeishuModeStatusCardInput = {
-  mode?: 'status' | 'launcher' | 'launcher_with_error';
+  mode?: 'status' | 'launcher' | 'launcher_with_error' | 'takeover_picker';
   displayMode: 'assistant' | 'coding';
   currentCodingTaskId?: string;
   currentTaskLifecycle?: string;
@@ -33,6 +33,18 @@ export type FeishuModeStatusCardInput = {
   launcherSelectedCwd?: string;
   launcherDraftCwd?: string;
   launcherError?: string;
+  takeoverPickerTasks?: Array<{
+    taskId: string;
+    lifecycle: string;
+    cwd?: string;
+    summary?: string;
+    updatedAtLabel?: string;
+  }>;
+  takeoverPickerPage?: number;
+  takeoverPickerTotalPages?: number;
+  takeoverPickerSelectedTaskId?: string;
+  takeoverPickerSnapshotUpdatedAt?: string;
+  takeoverPickerError?: string;
 };
 
 type FeishuCardButtonValue =
@@ -41,9 +53,15 @@ type FeishuCardButtonValue =
         | 'switch_mode_assistant'
         | 'switch_mode_coding'
         | 'open_task_picker'
+        | 'open_takeover_picker'
         | 'create_new_task'
         | 'interrupt_stalled_task'
         | 'return_to_launcher'
+        | 'return_to_status'
+        | 'takeover_picker_prev_page'
+        | 'takeover_picker_next_page'
+        | 'refresh_takeover_picker'
+        | 'confirm_takeover_task'
         | 'close_current_task';
       cardSource?: 'reply_status_card' | 'approval_card';
     }
@@ -57,6 +75,7 @@ type FeishuCardButtonValue =
       turnId: string;
     }
   | { kind: 'pick_current_task'; taskId: `T${number}` }
+  | { kind: 'pick_takeover_task'; taskId: `T${number}` }
   | { kind: 'select_recent_cwd'; cwd: string }
   | { kind: 'submit_launch_coding' }
   | {
@@ -103,16 +122,36 @@ function buildFormSubmitButton(
 }
 
 function resolveMainActionButtonType(
-  kind: Exclude<FeishuCardButtonValue['kind'], 'pick_current_task'>,
+  kind:
+    | 'switch_mode_assistant'
+    | 'switch_mode_coding'
+    | 'open_task_picker'
+    | 'open_takeover_picker'
+    | 'create_new_task'
+    | 'query_current_task'
+    | 'interrupt_stalled_task'
+    | 'return_to_launcher'
+    | 'return_to_status'
+    | 'takeover_picker_prev_page'
+    | 'takeover_picker_next_page'
+    | 'refresh_takeover_picker'
+    | 'confirm_takeover_task'
+    | 'close_current_task',
   displayMode: FeishuModeStatusCardInput['displayMode']
 ): 'default' | 'primary' | 'danger' {
   if (
     (kind === 'switch_mode_assistant' && displayMode !== 'assistant') ||
     (kind === 'switch_mode_coding' && displayMode !== 'coding') ||
     kind === 'open_task_picker' ||
+    kind === 'open_takeover_picker' ||
     kind === 'create_new_task' ||
     kind === 'query_current_task' ||
-    kind === 'return_to_launcher'
+    kind === 'return_to_launcher' ||
+    kind === 'return_to_status' ||
+    kind === 'takeover_picker_prev_page' ||
+    kind === 'takeover_picker_next_page' ||
+    kind === 'refresh_takeover_picker' ||
+    kind === 'confirm_takeover_task'
   ) {
     return 'primary';
   }
@@ -514,6 +553,103 @@ function buildLauncherElements(input: FeishuModeStatusCardInput): Array<Record<s
   ];
 }
 
+function buildTakeoverPickerTaskElements(
+  tasks: NonNullable<FeishuModeStatusCardInput['takeoverPickerTasks']>,
+  selectedTaskId?: string
+): Array<Record<string, unknown>> {
+  return tasks.flatMap((task) => {
+    const detailLines = [
+      task.taskId === selectedTaskId ? `**已选中：${task.taskId} · ${task.lifecycle}**` : `**${task.taskId} · ${task.lifecycle}**`,
+      `路径：${task.cwd?.trim() || '未记录'}`,
+      `任务摘要：${task.summary?.trim() || '暂无摘要'}`
+    ];
+    if (task.updatedAtLabel?.trim()) {
+      detailLines.push(`最近活动：${task.updatedAtLabel.trim()}`);
+    }
+    return [
+      { tag: 'markdown', content: detailLines.join('\n') },
+      buildSingleButtonRow(
+        buildCallbackButton(
+          `选择 ${task.taskId}`,
+          { kind: 'pick_takeover_task', taskId: task.taskId as `T${number}` },
+          task.taskId === selectedTaskId ? 'primary' : 'default'
+        )
+      )
+    ];
+  });
+}
+
+function buildTakeoverPickerElements(input: FeishuModeStatusCardInput): Array<Record<string, unknown>> {
+  const pageIndex = Math.max(0, input.takeoverPickerPage ?? 0);
+  const totalPages = Math.max(1, input.takeoverPickerTotalPages ?? 1);
+  const tasks = input.takeoverPickerTasks ?? [];
+  const elements: Array<Record<string, unknown>> = [
+    { tag: 'markdown', content: '**本地 Codex 接管**' },
+    { tag: 'markdown', content: `当前页：第 ${pageIndex + 1} / ${totalPages} 页` }
+  ];
+  if (input.takeoverPickerSnapshotUpdatedAt?.trim()) {
+    elements.push({ tag: 'markdown', content: `快照时间：${input.takeoverPickerSnapshotUpdatedAt.trim()}` });
+  }
+  if (input.takeoverPickerError?.trim()) {
+    elements.push({ tag: 'markdown', content: `**错误：${input.takeoverPickerError.trim()}**` });
+  }
+  if (input.takeoverPickerSelectedTaskId?.trim()) {
+    elements.push({ tag: 'markdown', content: `已选中：${input.takeoverPickerSelectedTaskId.trim()}` });
+  }
+  if (tasks.length === 0) {
+    elements.push({ tag: 'markdown', content: '当前没有可接管的本地 Codex Coding 会话' });
+  } else {
+    elements.push(...buildTakeoverPickerTaskElements(tasks, input.takeoverPickerSelectedTaskId));
+  }
+
+  if (pageIndex > 0) {
+    elements.push(
+      buildSingleButtonRow(
+        buildCallbackButton(
+          '上一页',
+          { kind: 'takeover_picker_prev_page' },
+          resolveMainActionButtonType('takeover_picker_prev_page', input.displayMode)
+        )
+      )
+    );
+  }
+  if (pageIndex + 1 < totalPages) {
+    elements.push(
+      buildSingleButtonRow(
+        buildCallbackButton(
+          '下一页',
+          { kind: 'takeover_picker_next_page' },
+          resolveMainActionButtonType('takeover_picker_next_page', input.displayMode)
+        )
+      )
+    );
+  }
+  elements.push(
+    buildSingleButtonRow(
+      buildCallbackButton(
+        '刷新列表',
+        { kind: 'refresh_takeover_picker' },
+        resolveMainActionButtonType('refresh_takeover_picker', input.displayMode)
+      )
+    ),
+    buildSingleButtonRow(
+      buildCallbackButton(
+        '确认接管',
+        { kind: 'confirm_takeover_task' },
+        resolveMainActionButtonType('confirm_takeover_task', input.displayMode)
+      )
+    ),
+    buildSingleButtonRow(
+      buildCallbackButton(
+        '返回状态卡',
+        { kind: 'return_to_status' },
+        resolveMainActionButtonType('return_to_status', input.displayMode)
+      )
+    )
+  );
+  return elements;
+}
+
 export function renderFeishuModeStatusCard(input: FeishuModeStatusCardInput): Record<string, unknown> {
   const mode = input.mode ?? 'status';
   if (mode === 'launcher' || mode === 'launcher_with_error') {
@@ -527,6 +663,20 @@ export function renderFeishuModeStatusCard(input: FeishuModeStatusCardInput): Re
         direction: 'vertical',
         padding: '12px 12px 12px 12px',
         elements: buildLauncherElements(input)
+      }
+    };
+  }
+  if (mode === 'takeover_picker') {
+    return {
+      schema: '2.0',
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: 'plain_text', content: 'Codex 模式状态' }
+      },
+      body: {
+        direction: 'vertical',
+        padding: '12px 12px 12px 12px',
+        elements: buildTakeoverPickerElements(input)
       }
     };
   }
@@ -550,6 +700,11 @@ export function renderFeishuModeStatusCard(input: FeishuModeStatusCardInput): Re
       '切换当前任务',
       { kind: 'open_task_picker' },
       resolveMainActionButtonType('open_task_picker', input.displayMode)
+    ),
+    buildCallbackButton(
+      '接管本地 Codex',
+      { kind: 'open_takeover_picker' },
+      resolveMainActionButtonType('open_takeover_picker', input.displayMode)
     ),
     buildCallbackButton(
       '新建任务',

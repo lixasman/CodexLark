@@ -7,8 +7,16 @@ function installerPath(): string {
   return path.join(process.cwd(), 'Install-CodexLark.ps1');
 }
 
+function processRunnerPath(): string {
+  return path.join(process.cwd(), 'scripts', 'setup', 'process-runner.ps1');
+}
+
 function readInstallerScript(): string {
   return readFileSync(installerPath(), 'utf8');
+}
+
+function readProcessRunnerScript(): string {
+  return readFileSync(processRunnerPath(), 'utf8');
 }
 
 function readInstallerBytes(): Buffer {
@@ -26,7 +34,10 @@ test('Install-CodexLark defines setup log directory and shared step runner', () 
   const script = readInstallerScript();
 
   assert.match(script, /\$setupLogDir = Join-Path \$repoRoot 'artifacts\\setup'/);
+  assert.match(script, /\$processRunnerPath = Join-Path \$repoRoot 'scripts\\setup\\process-runner\.ps1'/);
+  assert.match(script, /\. \$processRunnerPath/);
   assert.match(script, /function Invoke-SetupStep\s*\{/);
+  assert.match(script, /function Invoke-SetupInteractiveStep\s*\{/);
   assert.match(script, /function Write-SetupStage\s*\{/);
   assert.match(script, /Write-Host \("\[\{0\}\/\{1\}\] \{2\}" -f \$StepNumber, \$TotalSteps, \$Title\)/);
 });
@@ -55,12 +66,14 @@ test('Install-CodexLark installs Codex CLI and pauses for login', () => {
   assert.match(script, /install-codex\.err\.log/);
 });
 
-test('Install-CodexLark prefers application shims over PowerShell wrapper scripts for npm-style commands', () => {
-  const script = readInstallerScript();
+test('process runner prefers application shims over PowerShell wrapper scripts and exposes split execution paths', () => {
+  const script = readProcessRunnerScript();
 
   assert.match(script, /Get-Command \$Name -All -ErrorAction SilentlyContinue/);
   assert.match(script, /\$applicationCommand = \$commands \| Where-Object \{ \$_.CommandType -eq 'Application' \} \| Select-Object -First 1/);
   assert.match(script, /if \(\$applicationCommand\) \{\s*return \$applicationCommand\.Source\s*\}/);
+  assert.match(script, /function Invoke-CodexLarkCommand\s*\{/);
+  assert.match(script, /function Invoke-CodexLarkInteractiveCommand\s*\{/);
 });
 
 test('Install-CodexLark collects Feishu settings and writes user environment variables', () => {
@@ -89,6 +102,7 @@ test('Install-CodexLark runs npm install, build, doctor, and writes an install s
   assert.match(script, /build\.out\.log/);
   assert.match(script, /doctor\.out\.log/);
   assert.match(script, /install-summary\.json/);
+  assert.match(script, /exit \$failureExitCode/);
 });
 
 test('Install-CodexLark generates launchers and gates startup on explicit confirmation', () => {

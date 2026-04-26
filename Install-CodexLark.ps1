@@ -21,6 +21,8 @@ $buildOutLog = Join-Path $setupLogDir 'build.out.log'
 $buildErrLog = Join-Path $setupLogDir 'build.err.log'
 $doctorOutLog = Join-Path $setupLogDir 'doctor.out.log'
 $doctorErrLog = Join-Path $setupLogDir 'doctor.err.log'
+$launcherSyncOutLog = Join-Path $setupLogDir 'launcher-sync.out.log'
+$launcherSyncErrLog = Join-Path $setupLogDir 'launcher-sync.err.log'
 $autostartOutLog = Join-Path $setupLogDir 'autostart-enable.out.log'
 $autostartErrLog = Join-Path $setupLogDir 'autostart-enable.err.log'
 $startLauncherPath = Join-Path $repoRoot 'Start-CodexLark.ps1'
@@ -28,16 +30,27 @@ $repairLauncherPath = Join-Path $repoRoot 'Repair-CodexLark.ps1'
 $autostartInstallerPath = Join-Path $repoRoot 'Install-CodexLark-Autostart.ps1'
 $adminScriptPath = Join-Path $repoRoot 'run-admin-task.ps1'
 $doctorScriptPath = Join-Path $repoRoot 'scripts\doctor.cjs'
+$runtimeContractPath = Join-Path $repoRoot 'scripts\setup\runtime-contract.ps1'
+$processRunnerPath = Join-Path $repoRoot 'scripts\setup\process-runner.ps1'
+$runtimeContractLogPath = Join-Path $setupLogDir 'runtime-contract.json'
+. $runtimeContractPath
+. $processRunnerPath
+$runtimeContract = Assert-CodexLarkSupportedHost -EntryPoint 'Install-CodexLark.ps1' -LogPath $runtimeContractLogPath -FailureCategory 'unsupported-host' -SupportDocPath 'docs/workflows/install-startup-support-matrix.md' -ManualFallbackHint '请改走 README.md 的手动路径（快速开始），按文档手动完成安装、构建与启动。'
 
 $global:SetupState = [ordered]@{
   repair = [bool]$Repair
   startedAt = (Get-Date).ToString('s')
+  hostContractStatus = $runtimeContract.status
+  hostRuntimeLog = $runtimeContract.logPath
+  runtime = $runtimeContract.runtime
+  hostWarnings = @($runtimeContract.warnings)
   nodeVersion = $null
   codexVersion = $null
   envUpdated = $false
   doctorOk = $false
   autostartEnabled = $false
   generatedLaunchers = @()
+  resolvedCommands = @()
   steps = @()
 }
 
@@ -84,7 +97,7 @@ function Write-Utf8BomFile {
 
 function Write-InstallSummary {
   $global:SetupState.completedAt = (Get-Date).ToString('s')
-  $json = $global:SetupState | ConvertTo-Json -Depth 6
+  $json = $global:SetupState | ConvertTo-Json -Depth 8
   Write-Utf8BomFile -Path $installSummaryPath -Content $json
 }
 
@@ -133,18 +146,7 @@ function Resolve-CommandSource {
     [Parameter(Mandatory = $true)][string]$Name
   )
 
-  $commands = @(Get-Command $Name -All -ErrorAction SilentlyContinue)
-  if ($commands.Count -eq 0) {
-    return $null
-  }
-
-  $applicationCommand = $commands | Where-Object { $_.CommandType -eq 'Application' } | Select-Object -First 1
-  if ($applicationCommand) {
-    return $applicationCommand.Source
-  }
-
-  $command = $commands | Select-Object -First 1
-  return $command.Source
+  return Resolve-CodexLarkCommandSource -Name $Name
 }
 
 function Invoke-SetupStep {
@@ -161,37 +163,97 @@ function Invoke-SetupStep {
   Initialize-SetupLogging
   Set-StepStatus -Name $StepName -Status 'started'
 
-  Remove-Item -Path @($StdoutPath, $StderrPath) -Force -ErrorAction SilentlyContinue
+  try {
+    $result = Invoke-CodexLarkCommand -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory -StdoutPath $StdoutPath -StderrPath $StderrPath -TimeoutSec $TimeoutSec
+  } catch {
+    $exception = $_.Exception
+    if (-not $exception.Data.Contains('StepName')) {
+      $exception.Data['StepName'] = $StepName
+    }
+    if (-not $exception.Data.Contains('StdoutPath')) {
+      $exception.Data['StdoutPath'] = $StdoutPath
+    }
+    if (-not $exception.Data.Contains('StderrPath')) {
+      $exception.Data['StderrPath'] = $StderrPath
+    }
+    $resolvedPath = $exception.Data['ResolvedPath']
+    if (-not [string]::IsNullOrWhiteSpace([string]$resolvedPath)) {
+      $global:SetupState.resolvedCommands += [pscustomobject]@{
+        step = $StepName
+        mode = 'non-interactive'
+        resolvedPath = [string]$resolvedPath
+        stdoutPath = $StdoutPath
+        stderrPath = $StderrPath
+      }
+    }
+    Set-StepStatus -Name $StepName -Status 'failed' -Detail "See $StdoutPath and $StderrPath"
+    throw $exception
+  }
 
-  $process = Start-Process -FilePath $FilePath `
-    -ArgumentList $ArgumentList `
-    -WorkingDirectory $WorkingDirectory `
-    -RedirectStandardOutput $StdoutPath `
-    -RedirectStandardError $StderrPath `
-    -PassThru
+  $global:SetupState.resolvedCommands += [pscustomobject]@{
+    step = $StepName
+    mode = $result.Mode
+    resolvedPath = $result.ResolvedPath
+    exitCode = $result.ExitCode
+    stdoutPath = $result.StdoutPath
+    stderrPath = $result.StderrPath
+  }
+
+  if ($result.ExitCode -ne 0) {
+    Set-StepStatus -Name $StepName -Status 'failed' -Detail "ExitCode=$($result.ExitCode). See $StdoutPath and $StderrPath"
+    $failure = [System.Exception]::new("步骤失败：$StepName 退出码为 $($result.ExitCode)。请检查日志：$StdoutPath 和 $StderrPath")
+    $failure.Data['StepName'] = $StepName
+    $failure.Data['ExitCode'] = [int]$result.ExitCode
+    $failure.Data['StdoutPath'] = $result.StdoutPath
+    $failure.Data['StderrPath'] = $result.StderrPath
+    $failure.Data['ResolvedPath'] = $result.ResolvedPath
+    throw $failure
+  }
+
+  Set-StepStatus -Name $StepName -Status 'passed' -Detail "Resolved=$($result.ResolvedPath). See $StdoutPath and $StderrPath"
+  return $result
+}
+
+function Invoke-SetupInteractiveStep {
+  param(
+    [Parameter(Mandatory = $true)][string]$StepName,
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [Parameter(Mandatory = $true)][string[]]$ArgumentList,
+    [string]$WorkingDirectory = $repoRoot
+  )
+
+  Initialize-SetupLogging
+  Set-StepStatus -Name $StepName -Status 'started'
 
   try {
-    Wait-Process -Id $process.Id -Timeout $TimeoutSec -ErrorAction Stop
+    $result = Invoke-CodexLarkInteractiveCommand -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory
   } catch {
-    if (-not $process.HasExited) {
-      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    $exception = $_.Exception
+    if (-not $exception.Data.Contains('StepName')) {
+      $exception.Data['StepName'] = $StepName
     }
-    Set-StepStatus -Name $StepName -Status 'failed' -Detail "Timed out after $TimeoutSec seconds. See $StdoutPath and $StderrPath"
-    throw "步骤失败：$StepName 超时。请检查日志：$StdoutPath 和 $StderrPath"
+    Set-StepStatus -Name $StepName -Status 'failed' -Detail ([string]$exception.Message)
+    throw $exception
   }
 
-  $process.Refresh()
-  if ($process.ExitCode -ne 0) {
-    Set-StepStatus -Name $StepName -Status 'failed' -Detail "ExitCode=$($process.ExitCode). See $StdoutPath and $StderrPath"
-    throw "步骤失败：$StepName 退出码为 $($process.ExitCode)。请检查日志：$StdoutPath 和 $StderrPath"
+  $global:SetupState.resolvedCommands += [pscustomobject]@{
+    step = $StepName
+    mode = $result.Mode
+    resolvedPath = $result.ResolvedPath
+    exitCode = $result.ExitCode
   }
 
-  Set-StepStatus -Name $StepName -Status 'passed' -Detail $StdoutPath
-  return [pscustomobject]@{
-    StdoutPath = $StdoutPath
-    StderrPath = $StderrPath
-    ExitCode = $process.ExitCode
+  if ($result.ExitCode -ne 0) {
+    Set-StepStatus -Name $StepName -Status 'failed' -Detail "ExitCode=$($result.ExitCode). Resolved=$($result.ResolvedPath)"
+    $failure = [System.Exception]::new("步骤失败：$StepName 退出码为 $($result.ExitCode)。")
+    $failure.Data['StepName'] = $StepName
+    $failure.Data['ExitCode'] = [int]$result.ExitCode
+    $failure.Data['ResolvedPath'] = $result.ResolvedPath
+    throw $failure
   }
+
+  Set-StepStatus -Name $StepName -Status 'passed' -Detail "Resolved=$($result.ResolvedPath)"
+  return $result
 }
 
 function Assert-SupportedPlatform {
@@ -345,10 +407,7 @@ function Ensure-CodexLogin {
 
   Write-Host '请先完成 Codex 登录。' -ForegroundColor Yellow
   Read-Host '确认后按 Enter 运行 codex --login'
-  & $CodexCommand --login
-  if ($LASTEXITCODE -ne 0) {
-    throw 'codex --login 未成功完成，请先完成登录后重新运行安装器。'
-  }
+  Invoke-SetupInteractiveStep -StepName 'codex --login' -FilePath $CodexCommand -ArgumentList @('--login') | Out-Null
 
   Read-Host '确认已完成 Codex 登录后按 Enter 继续'
   if (-not (Test-CodexLoginMarker)) {
@@ -492,6 +551,15 @@ function New-LauncherScripts {
   $global:SetupState.generatedLaunchers = @('Start-CodexLark.ps1', 'Repair-CodexLark.ps1')
 }
 
+function Sync-CanonicalLauncherManifest {
+  param(
+    [Parameter(Mandatory = $true)][string]$NodeCommand
+  )
+
+  $syncScript = "const { ensureSourceRuntimeManifest } = require('./dist/setup/launcher.js'); ensureSourceRuntimeManifest(process.cwd(), process.env);"
+  Invoke-SetupStep -StepName 'Sync launcher manifest' -FilePath $NodeCommand -ArgumentList @('-e', $syncScript) -StdoutPath $launcherSyncOutLog -StderrPath $launcherSyncErrLog -TimeoutSec 300 | Out-Null
+}
+
 function Configure-OptionalAutostart {
   if (-not (Read-YesNo -Prompt '是否启用开机自启动？' -DefaultYes $false)) {
     Set-StepStatus -Name 'Enable auto-start' -Status 'skipped' -Detail 'User declined optional auto-start setup.'
@@ -570,6 +638,7 @@ try {
 
   Write-SetupStage -StepNumber 8 -TotalSteps $totalSteps -Title '生成后续启动与修复入口'
   New-LauncherScripts
+  Sync-CanonicalLauncherManifest -NodeCommand $nodeCommand
 
   if (-not $Repair) {
     Write-SetupStage -StepNumber 9 -TotalSteps $totalSteps -Title '可选配置开机自启动'
@@ -582,9 +651,24 @@ try {
 } catch {
   $global:SetupState.failed = $true
   $global:SetupState.failureMessage = $_.Exception.Message
+  $failureData = $_.Exception.Data
+  $failureExitCode = 1
+  if ($failureData -and $failureData.Contains('ExitCode') -and $null -ne $failureData['ExitCode']) {
+    $failureExitCode = [int]$failureData['ExitCode']
+  }
+  $global:SetupState.failureExitCode = $failureExitCode
+  if ($failureData -and $failureData.Contains('StepName')) {
+    $global:SetupState.failureStep = [string]$failureData['StepName']
+  }
+  if ($failureData -and ($failureData.Contains('StdoutPath') -or $failureData.Contains('StderrPath'))) {
+    $global:SetupState.failureLogs = [ordered]@{
+      stdout = [string]$failureData['StdoutPath']
+      stderr = [string]$failureData['StderrPath']
+    }
+  }
   Write-Host $_.Exception.Message -ForegroundColor Red
   Write-Host "安装日志位于：$setupLogDir" -ForegroundColor Yellow
-  exit 1
+  exit $failureExitCode
 } finally {
   Write-InstallSummary
 }

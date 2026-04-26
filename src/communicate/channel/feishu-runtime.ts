@@ -15,6 +15,7 @@ import { createTaskGoalSummaryGeneratorFromCodexCommand } from '../summary/task-
 import { extractCodexModelFromCommand } from '../control/codex-model';
 
 const MESSAGE_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const STARTUP_STALE_TEXT_GRACE_MS = 30 * 60 * 1000;
 const FEISHU_DEBUG = process.env.COMMUNICATE_FEISHU_DEBUG === '1';
 
 function logFeishuDebug(message: string, extra?: Record<string, unknown>): void {
@@ -34,6 +35,24 @@ function logFeishuDebug(message: string, extra?: Record<string, unknown>): void 
 function normalizeFeishuTimestampMs(value?: number): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   return value < 1_000_000_000_000 ? value * 1000 : value;
+}
+
+function isStartupStaleText(input: {
+  incomingCreateTimeMs?: number;
+  lastAcceptedTextCreateTimeMs?: number;
+  runtimeStartedAtMs?: number;
+}): boolean {
+  if (
+    input.incomingCreateTimeMs === undefined
+    || input.lastAcceptedTextCreateTimeMs === undefined
+    || input.runtimeStartedAtMs === undefined
+  ) {
+    return false;
+  }
+  return (
+    input.incomingCreateTimeMs < input.lastAcceptedTextCreateTimeMs &&
+    input.incomingCreateTimeMs < input.runtimeStartedAtMs - STARTUP_STALE_TEXT_GRACE_MS
+  );
 }
 
 type PersistentFeishuInboundDeduper = {
@@ -202,13 +221,23 @@ export function createFeishuLongConnectionRuntime(config: FeishuLongConnectionRu
     return sessionRegistry.getThreadUiState(threadId)?.lastAcceptedTextCreateTimeMs;
   }
 
+  const startupTextWatermarkByThreadId = new Map<string, number | undefined>();
+  function getStartupTextWatermarkMs(threadId: string, currentWatermarkMs: number | undefined): number | undefined {
+    if (!startupTextWatermarkByThreadId.has(threadId)) {
+      // Freeze the restart baseline so out-of-order startup replays do not chase newer messages.
+      startupTextWatermarkByThreadId.set(threadId, currentWatermarkMs);
+    }
+    return startupTextWatermarkByThreadId.get(threadId);
+  }
+
   function markAcceptedTextCreateTimeMs(threadId: string, createTimeMs: number): void {
     const current = sessionRegistry.getThreadUiState(threadId);
-    if (current?.lastAcceptedTextCreateTimeMs === createTimeMs) return;
+    const nextCreateTimeMs = Math.max(current?.lastAcceptedTextCreateTimeMs ?? 0, createTimeMs);
+    if (current?.lastAcceptedTextCreateTimeMs === nextCreateTimeMs) return;
     sessionRegistry.upsertThreadUiState({
       feishuThreadId: threadId,
       displayMode: current?.displayMode ?? 'assistant',
-      lastAcceptedTextCreateTimeMs: createTimeMs
+      lastAcceptedTextCreateTimeMs: nextCreateTimeMs
     });
   }
 
@@ -352,10 +381,40 @@ export function createFeishuLongConnectionRuntime(config: FeishuLongConnectionRu
       }
       try {
         const lastAcceptedTextCreateTimeMs = getLastAcceptedTextCreateTimeMs(message.threadId);
+        const startupTextWatermarkMs = getStartupTextWatermarkMs(message.threadId, lastAcceptedTextCreateTimeMs);
+        const startupStaleCutoffMs =
+          runtimeStartedAtMs !== undefined
+            ? runtimeStartedAtMs - STARTUP_STALE_TEXT_GRACE_MS
+            : undefined;
+        if (isStartupStaleText({
+          incomingCreateTimeMs,
+          lastAcceptedTextCreateTimeMs: startupTextWatermarkMs,
+          runtimeStartedAtMs
+        })) {
+          logFeishuDebug('inbound startup stale ignored', {
+            kind: 'text',
+            threadId: message.threadId,
+            eventId: message.eventId,
+            messageId: message.messageId,
+            frameMessageId: message.frameMessageId,
+            traceId: message.traceId,
+            createTime: message.createTime,
+            incomingCreateTimeMs,
+            lastAcceptedTextCreateTimeMs: startupTextWatermarkMs,
+            currentLastAcceptedTextCreateTimeMs: lastAcceptedTextCreateTimeMs,
+            runtimeStartedAtMs,
+            startupStaleCutoffMs,
+            dedupeId
+          });
+          claimed?.complete();
+          return;
+        }
+        // Compare against the restart baseline only; moving watermarks can drop delayed messages.
+        const staleWatermarkMs = startupTextWatermarkMs;
         if (
           incomingCreateTimeMs !== undefined &&
-          lastAcceptedTextCreateTimeMs !== undefined &&
-          incomingCreateTimeMs <= lastAcceptedTextCreateTimeMs
+          staleWatermarkMs !== undefined &&
+          incomingCreateTimeMs < staleWatermarkMs
         ) {
           logFeishuDebug('inbound stale ignored', {
             kind: 'text',
@@ -366,7 +425,8 @@ export function createFeishuLongConnectionRuntime(config: FeishuLongConnectionRu
             traceId: message.traceId,
             createTime: message.createTime,
             incomingCreateTimeMs,
-            lastAcceptedTextCreateTimeMs,
+            lastAcceptedTextCreateTimeMs: staleWatermarkMs,
+            currentLastAcceptedTextCreateTimeMs: lastAcceptedTextCreateTimeMs,
             dedupeId
           });
           claimed?.release();
@@ -480,6 +540,7 @@ export function createFeishuLongConnectionRuntime(config: FeishuLongConnectionRu
   });
 
   let lease: FeishuLongConnectionLeaseHandle | null = null;
+  let runtimeStartedAtMs: number | undefined;
 
   return {
     service,
@@ -496,16 +557,22 @@ export function createFeishuLongConnectionRuntime(config: FeishuLongConnectionRu
           if (lease === acquiredLease) {
             lease = null;
           }
+          runtimeStartedAtMs = undefined;
+          startupTextWatermarkByThreadId.clear();
           logFeishuDebug('runtime lease stop', { error: error.message });
           void client.stop();
           void config.onLeaseLost?.(error);
         }
       });
       lease = acquiredLease;
+      startupTextWatermarkByThreadId.clear();
+      runtimeStartedAtMs = Date.now();
       try {
         await client.start();
       } catch (error) {
         lease = null;
+        runtimeStartedAtMs = undefined;
+        startupTextWatermarkByThreadId.clear();
         acquiredLease.release();
         throw error;
       }
@@ -520,6 +587,8 @@ export function createFeishuLongConnectionRuntime(config: FeishuLongConnectionRu
     async stop(): Promise<void> {
       const activeLease = lease;
       lease = null;
+      runtimeStartedAtMs = undefined;
+      startupTextWatermarkByThreadId.clear();
       try {
         await client.stop();
       } finally {

@@ -113,6 +113,115 @@ function nextTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+async function dispatchCardActionThroughLongconn(input: {
+  frameMessageId: string;
+  actionValue?: unknown;
+  actionName?: string;
+  formValue?: Record<string, unknown>;
+  context?: Record<string, unknown>;
+}): Promise<{
+  seen: Array<Record<string, unknown>>;
+  ackPayload: Record<string, unknown>;
+}> {
+  const { createFeishuLongConnectionClient } = require('../../src/communicate/channel/feishu-longconn') as {
+    createFeishuLongConnectionClient: (options: Record<string, any>) => { start: () => Promise<void>; stop: () => Promise<void> };
+  };
+  const { decodeFeishuFrame, encodeFeishuFrame } = require('../../src/communicate/channel/feishu-frame') as {
+    decodeFeishuFrame: (buffer: Uint8Array) => Record<string, any>;
+    encodeFeishuFrame: (frame: Record<string, unknown>) => Uint8Array;
+  };
+
+  const seen: Array<Record<string, unknown>> = [];
+  let socket: MockWebSocket | undefined;
+
+  const client = createFeishuLongConnectionClient({
+    appId: 'app-id',
+    appSecret: 'app-secret',
+    fetchImpl: async (): Promise<Response> =>
+      new Response(
+        JSON.stringify({
+          code: 0,
+          data: {
+            URL: 'wss://example.test/ws?device_id=device-1&service_id=321',
+            ClientConfig: {
+              PingInterval: 30,
+              ReconnectCount: 3,
+              ReconnectInterval: 5,
+              ReconnectNonce: 0
+            }
+          }
+        }),
+        { status: 200 }
+      ),
+    createWebSocket: (url: string) => {
+      socket = new MockWebSocket(url);
+      return socket;
+    },
+    onTextMessage: async () => undefined,
+    onCardAction: async (action: Record<string, unknown>) => {
+      seen.push(action);
+    }
+  });
+
+  await client.start();
+  await nextTick();
+
+  try {
+    const payload = new TextEncoder().encode(
+      JSON.stringify({
+        schema: '2.0',
+        header: { event_type: 'card.action.trigger' },
+        event: {
+          context: {
+            open_chat_id: 'oc_takeover',
+            open_message_id: 'om_takeover_card',
+            ...(input.context ?? {})
+          },
+          action: {
+            ...(input.actionName ? { name: input.actionName } : {}),
+            ...(input.formValue ? { form_value: input.formValue } : {}),
+            ...(input.actionValue !== undefined ? { value: input.actionValue } : {})
+          }
+        }
+      })
+    );
+
+    socket?.emitMessage(
+      encodeFeishuFrame({
+        SeqID: 101n,
+        LogID: 102n,
+        service: 321,
+        method: 1,
+        headers: [
+          { key: 'type', value: 'event' },
+          { key: 'message_id', value: input.frameMessageId },
+          { key: 'sum', value: '1' },
+          { key: 'seq', value: '0' }
+        ],
+        payload
+      })
+    );
+    await nextTick();
+
+    const ackFrame = socket?.sent
+      .map((buffer) => decodeFeishuFrame(buffer))
+      .find(
+        (frame) =>
+          frame.method === 1 &&
+          (frame.headers ?? []).some(
+            (header: { key: string; value: string }) => header.key === 'message_id' && header.value === input.frameMessageId
+          )
+      );
+    assert.ok(ackFrame, `expected callback response for ${input.frameMessageId}`);
+    return {
+      seen,
+      ackPayload: JSON.parse(new TextDecoder().decode(ackFrame.payload))
+    };
+  } finally {
+    await client.stop();
+  }
+}
+
 function stubCommonJsModule(modulePath: string, exports: Record<string, unknown>): () => void {
   const original = require.cache[modulePath];
   require.cache[modulePath] = {
@@ -1110,6 +1219,175 @@ test('long connection dispatches launcher submit card action with form value', a
   } finally {
     await client.stop();
   }
+});
+
+test('long connection dispatches open takeover picker callback', async () => {
+  const { seen, ackPayload } = await dispatchCardActionThroughLongconn({
+    frameMessageId: 'msg-card-takeover-open-1',
+    actionValue: { kind: 'open_takeover_picker' }
+  });
+
+  assert.deepEqual(seen[0], {
+    threadId: 'feishu:chat:oc_takeover',
+    messageId: 'om_takeover_card',
+    eventId: undefined,
+    traceId: undefined,
+    frameMessageId: 'msg-card-takeover-open-1',
+    kind: 'open_takeover_picker'
+  });
+  assert.equal(ackPayload.code, 200);
+  assert.equal(typeof ackPayload.data, 'string');
+  assert.deepEqual(JSON.parse(Buffer.from(String(ackPayload.data), 'base64').toString('utf8')), {
+    toast: {
+      type: 'info',
+      content: '正在加载本地 Codex 列表'
+    }
+  });
+});
+
+test('long connection dispatches pick takeover task callback with task id', async () => {
+  const { seen, ackPayload } = await dispatchCardActionThroughLongconn({
+    frameMessageId: 'msg-card-takeover-pick-1',
+    actionValue: JSON.stringify({ kind: 'pick_takeover_task', taskId: 'T31' })
+  });
+
+  assert.deepEqual(seen[0], {
+    threadId: 'feishu:chat:oc_takeover',
+    messageId: 'om_takeover_card',
+    eventId: undefined,
+    traceId: undefined,
+    frameMessageId: 'msg-card-takeover-pick-1',
+    kind: 'pick_takeover_task',
+    taskId: 'T31'
+  });
+  assert.equal(ackPayload.code, 200);
+  assert.equal(typeof ackPayload.data, 'string');
+  assert.deepEqual(JSON.parse(Buffer.from(String(ackPayload.data), 'base64').toString('utf8')), {
+    toast: {
+      type: 'info',
+      content: '正在选择 T31'
+    }
+  });
+});
+
+test('long connection dispatches takeover picker previous page callback', async () => {
+  const { seen, ackPayload } = await dispatchCardActionThroughLongconn({
+    frameMessageId: 'msg-card-takeover-prev-1',
+    actionValue: { kind: 'takeover_picker_prev_page' }
+  });
+
+  assert.deepEqual(seen[0], {
+    threadId: 'feishu:chat:oc_takeover',
+    messageId: 'om_takeover_card',
+    eventId: undefined,
+    traceId: undefined,
+    frameMessageId: 'msg-card-takeover-prev-1',
+    kind: 'takeover_picker_prev_page'
+  });
+  assert.equal(ackPayload.code, 200);
+  assert.equal(typeof ackPayload.data, 'string');
+  assert.deepEqual(JSON.parse(Buffer.from(String(ackPayload.data), 'base64').toString('utf8')), {
+    toast: {
+      type: 'info',
+      content: '正在加载上一页'
+    }
+  });
+});
+
+test('long connection dispatches takeover picker next page callback', async () => {
+  const { seen, ackPayload } = await dispatchCardActionThroughLongconn({
+    frameMessageId: 'msg-card-takeover-next-1',
+    actionValue: { kind: 'takeover_picker_next_page' }
+  });
+
+  assert.deepEqual(seen[0], {
+    threadId: 'feishu:chat:oc_takeover',
+    messageId: 'om_takeover_card',
+    eventId: undefined,
+    traceId: undefined,
+    frameMessageId: 'msg-card-takeover-next-1',
+    kind: 'takeover_picker_next_page'
+  });
+  assert.equal(ackPayload.code, 200);
+  assert.equal(typeof ackPayload.data, 'string');
+  assert.deepEqual(JSON.parse(Buffer.from(String(ackPayload.data), 'base64').toString('utf8')), {
+    toast: {
+      type: 'info',
+      content: '正在加载下一页'
+    }
+  });
+});
+
+test('long connection dispatches refresh takeover picker callback', async () => {
+  const { seen, ackPayload } = await dispatchCardActionThroughLongconn({
+    frameMessageId: 'msg-card-takeover-refresh-1',
+    actionValue: { kind: 'refresh_takeover_picker' }
+  });
+
+  assert.deepEqual(seen[0], {
+    threadId: 'feishu:chat:oc_takeover',
+    messageId: 'om_takeover_card',
+    eventId: undefined,
+    traceId: undefined,
+    frameMessageId: 'msg-card-takeover-refresh-1',
+    kind: 'refresh_takeover_picker'
+  });
+  assert.equal(ackPayload.code, 200);
+  assert.equal(typeof ackPayload.data, 'string');
+  assert.deepEqual(JSON.parse(Buffer.from(String(ackPayload.data), 'base64').toString('utf8')), {
+    toast: {
+      type: 'info',
+      content: '正在刷新本地 Codex 列表'
+    }
+  });
+});
+
+test('long connection dispatches confirm takeover task callback', async () => {
+  const { seen, ackPayload } = await dispatchCardActionThroughLongconn({
+    frameMessageId: 'msg-card-takeover-confirm-1',
+    actionValue: { kind: 'confirm_takeover_task' }
+  });
+
+  assert.deepEqual(seen[0], {
+    threadId: 'feishu:chat:oc_takeover',
+    messageId: 'om_takeover_card',
+    eventId: undefined,
+    traceId: undefined,
+    frameMessageId: 'msg-card-takeover-confirm-1',
+    kind: 'confirm_takeover_task'
+  });
+  assert.equal(ackPayload.code, 200);
+  assert.equal(typeof ackPayload.data, 'string');
+  assert.deepEqual(JSON.parse(Buffer.from(String(ackPayload.data), 'base64').toString('utf8')), {
+    toast: {
+      type: 'info',
+      content: '正在确认接管'
+    }
+  });
+});
+
+test('long connection dispatches return to status callback', async () => {
+  const { seen, ackPayload } = await dispatchCardActionThroughLongconn({
+    frameMessageId: 'msg-card-takeover-return-1',
+    actionValue: { kind: 'return_to_status' }
+  });
+
+  assert.deepEqual(seen[0], {
+    threadId: 'feishu:chat:oc_takeover',
+    messageId: 'om_takeover_card',
+    eventId: undefined,
+    traceId: undefined,
+    frameMessageId: 'msg-card-takeover-return-1',
+    kind: 'return_to_status'
+  });
+  assert.equal(ackPayload.code, 200);
+  assert.equal(typeof ackPayload.data, 'string');
+  assert.deepEqual(JSON.parse(Buffer.from(String(ackPayload.data), 'base64').toString('utf8')), {
+    toast: {
+      type: 'info',
+      content: '正在返回状态卡'
+    }
+  });
 });
 
 test('long connection dumps raw event payload before parse for sparse callback debugging', async () => {

@@ -14,8 +14,13 @@ export type CodexCliSessionInfo = {
   lastTextTs?: number;
 };
 
+export type CodexCliScanResult =
+  | { ok: true; sessions: CodexCliSessionInfo[] }
+  | { ok: false; error: string };
+
 type ScanOptions = {
   codexHome?: string;
+  includeRolloutMetadata?: boolean;
 };
 
 export function scanCodexCliSessions(options: ScanOptions = {}): CodexCliSessionInfo[] {
@@ -55,14 +60,16 @@ export function scanCodexCliSessions(options: ScanOptions = {}): CodexCliSession
   }
 
   const rolloutMetadataByThread = new Map<string, { cwd?: string; model?: string }>();
-  for (const filePath of listRolloutFiles(sessionsRoot)) {
-    const rolloutMetadata = readRolloutMetadata(filePath);
-    if (!rolloutMetadata.threadId) continue;
-    const current = rolloutMetadataByThread.get(rolloutMetadata.threadId) ?? {};
-    rolloutMetadataByThread.set(rolloutMetadata.threadId, {
-      cwd: current.cwd ?? rolloutMetadata.cwd,
-      model: current.model ?? rolloutMetadata.model
-    });
+  if (options.includeRolloutMetadata !== false) {
+    for (const filePath of listRolloutFiles(sessionsRoot)) {
+      const rolloutMetadata = readRolloutMetadata(filePath);
+      if (!rolloutMetadata.threadId) continue;
+      const current = rolloutMetadataByThread.get(rolloutMetadata.threadId) ?? {};
+      rolloutMetadataByThread.set(rolloutMetadata.threadId, {
+        cwd: current.cwd ?? rolloutMetadata.cwd,
+        model: current.model ?? rolloutMetadata.model
+      });
+    }
   }
 
   for (const [threadId, first] of firstTextByThread) {
@@ -110,6 +117,20 @@ export function scanCodexCliSessions(options: ScanOptions = {}): CodexCliSession
   });
 }
 
+export function scanCodexCliSessionsResult(options: ScanOptions = {}): CodexCliScanResult {
+  try {
+    return {
+      ok: true,
+      sessions: scanCodexCliSessions(options)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
 function resolveCodexHome(override?: string): string {
   if (override && override.trim()) return override;
   const envHome = (process.env.COMMUNICATE_CODEX_HOME || '').trim() || (process.env.CODEX_HOME || '').trim();
@@ -126,9 +147,17 @@ function readJsonLines(filePath: string): Array<Record<string, any>> {
       .filter(Boolean)
       .map((line) => safeJsonParse(line))
       .filter((value): value is Record<string, any> => Boolean(value));
-  } catch {
-    return [];
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return [];
+    }
+    throw error;
   }
+}
+
+function isMissingFileError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
 }
 
 function readRolloutMetadata(filePath: string): {
@@ -164,8 +193,11 @@ function readRolloutMetadata(filePath: string): {
         break;
       }
     }
-  } catch {
-    return result;
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return result;
+    }
+    throw error;
   }
   return result;
 }
@@ -193,8 +225,16 @@ function safeJsonParse(line: string): Record<string, any> | null {
 
 function listRolloutFiles(rootDir: string): string[] {
   const files: string[] = [];
-  if (!fs.existsSync(rootDir)) return files;
-  for (const entry of fs.readdirSync(rootDir, { withFileTypes: true })) {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(rootDir, { withFileTypes: true });
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return files;
+    }
+    throw error;
+  }
+  for (const entry of entries) {
     const full = path.join(rootDir, entry.name);
     if (entry.isDirectory()) {
       files.push(...listRolloutFiles(full));

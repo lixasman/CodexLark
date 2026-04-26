@@ -117,8 +117,7 @@ export function routeUserMessage(input: RouteUserMessageInput): StructuredTaskCo
     };
   }
 
-  const takeoverMatch = /接管.*codex/i.test(text);
-  if (takeoverMatch) {
+  if (isExplicitTakeoverCommand(text)) {
     return {
       ...baseCommand(input, 'takeover_local_codex'),
       intent: 'takeover_local_codex',
@@ -196,6 +195,10 @@ function extractAsciiWindowsPath(text: string): string | undefined {
   const matched = text.match(/([A-Za-z]:\\[A-Za-z0-9_ .()\\/-]+)/);
   const normalized = matched?.[1]?.trim().replace(/[。！!，,；;：:]+$/u, '');
   return normalized && /^[A-Za-z]:\\/.test(normalized) ? normalized : undefined;
+}
+
+function isExplicitTakeoverCommand(text: string): boolean {
+  return /^接管(?:本地)?\s*codex(?:\s*(?:会话|窗口|任务|项目))?\s*[。，,；：:]*$/i.test(text.trim());
 }
 
 function shouldStartCodexSession(text: string): boolean {

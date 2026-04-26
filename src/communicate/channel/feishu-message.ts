@@ -25,10 +25,16 @@ export type FeishuCardActionEvent =
         | 'switch_mode_assistant'
         | 'switch_mode_coding'
         | 'open_task_picker'
+        | 'open_takeover_picker'
         | 'create_new_task'
         | 'query_current_task'
         | 'interrupt_stalled_task'
+        | 'takeover_picker_prev_page'
+        | 'takeover_picker_next_page'
+        | 'refresh_takeover_picker'
+        | 'confirm_takeover_task'
         | 'return_to_launcher'
+        | 'return_to_status'
         | 'close_current_task'
         | 'submit_launch_coding';
       cwd?: string;
@@ -40,7 +46,7 @@ export type FeishuCardActionEvent =
       eventId?: string;
       traceId?: string;
       frameMessageId?: string;
-      kind: 'pick_current_task';
+      kind: 'pick_current_task' | 'pick_takeover_task';
       taskId: `T${number}`;
     }
   | {
@@ -182,13 +188,13 @@ export function parseFeishuCardActionEvent(payload: any): FeishuCardActionEvent 
   ) ?? '';
   const actionName = typeof action.name === 'string' ? action.name.trim() : '';
   const effectiveKind = kind || actionName;
-  if (effectiveKind === 'pick_current_task') {
+  if (effectiveKind === 'pick_current_task' || effectiveKind === 'pick_takeover_task') {
     const taskId = extractTrimmedString(value && typeof value === 'object' ? (value as Record<string, unknown>).taskId : undefined) ?? '';
     if (!/^T\d+$/.test(taskId)) return null;
     return {
       threadId: normalizeFeishuThreadId(chatId),
       messageId,
-      kind: 'pick_current_task',
+      kind: effectiveKind,
       taskId: taskId as `T${number}`
     };
   }
@@ -225,10 +231,16 @@ export function parseFeishuCardActionEvent(payload: any): FeishuCardActionEvent 
     effectiveKind === 'switch_mode_assistant' ||
     effectiveKind === 'switch_mode_coding' ||
     effectiveKind === 'open_task_picker' ||
+    effectiveKind === 'open_takeover_picker' ||
     effectiveKind === 'create_new_task' ||
     effectiveKind === 'query_current_task' ||
     effectiveKind === 'interrupt_stalled_task' ||
+    effectiveKind === 'takeover_picker_prev_page' ||
+    effectiveKind === 'takeover_picker_next_page' ||
+    effectiveKind === 'refresh_takeover_picker' ||
+    effectiveKind === 'confirm_takeover_task' ||
     effectiveKind === 'return_to_launcher' ||
+    effectiveKind === 'return_to_status' ||
     effectiveKind === 'close_current_task'
   ) {
     const base = {
