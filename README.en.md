@@ -41,7 +41,7 @@ Existing tasks stay actionable from Feishu, so you do not have to hunt through l
 - Teams looking for a cross-platform shared service
 - Users who cannot accept an elevated PowerShell restart flow for the Feishu long-connection process
 - Anyone who only wants a generic chat-to-agent integration layer
-- Anyone expecting a polished public API or formal distribution workflow today
+- Anyone looking for a hosted multi-user service instead of a local Windows workflow
 
 ## Typical Workflow
 
@@ -51,9 +51,30 @@ Existing tasks stay actionable from Feishu, so you do not have to hunt through l
 4. Take over an existing task when needed
 5. Keep local work moving in the same thread
 
-If you are new to the project, start with the installer and the quick evaluation path below.
+If you are new to the project, start with the `.exe` installer path below. Use the source/manual path only when you want to evaluate, develop, or troubleshoot from the repository.
 
-## Environment Requirements
+## Feishu Shortcut: Project Card
+
+When the chat gets long and the main status card has moved out of sight, send exactly `项目卡` in the same Feishu thread to bring the current main control card back to the bottom.
+
+Use it when:
+
+- you want to switch projects or create a new project without scrolling back through the thread
+- you want the current control entry point close to the latest conversation
+- the current card is a launcher, status card, or error-state card and you want to recall that same view
+
+Rules:
+
+- the keyword is exactly `项目卡`
+- surrounding spaces are accepted, but extra words are not
+- the message is not forwarded to the active Codex task as normal chat input
+- the service re-sends the card that matches the current thread state instead of forcing a launcher view
+
+Think of it as "send the current status card to the bottom again."
+
+## Source / Manual Environment Requirements
+
+If you are using the `.exe` installer as a normal download user, you can skip this section. These prerequisites mainly apply to source builds, manual troubleshooting, and developer workflows.
 
 - Windows
 - PowerShell
@@ -63,7 +84,7 @@ If you are new to the project, start with the installer and the quick evaluation
 
 ## Minimal Feishu Open Platform Setup
 
-The installer can prepare Node.js, Codex CLI, and the local project environment, but it does not configure your Feishu app for you.
+The `.exe` installer and the source installer can prepare the local runtime, but they do not configure your Feishu app for you.
 
 Before running the installer or starting the runtime manually, make sure the Feishu side is prepared:
 
@@ -77,15 +98,63 @@ Before running the installer or starting the runtime manually, make sure the Fei
 
 If the Feishu console labels differ from this README, search by permission code or event code first.
 
-## Recommended First-Run Installer
+## Recommended Install Path
 
-If you are completely new to this repository, start with `Install-CodexLark.ps1` from the repo root instead of walking the manual setup path.
+### Product Installer Direction
 
-Supported scope for the first version:
+- Normal download users should use `CodexLark-Setup-<version>.exe` plus the first-run wizard.
+- The repository PowerShell installer remains available for source builds, local development, and troubleshooting, but it is no longer the main path for normal users.
+
+Start from the path that matches your role:
+
+- Normal download users: see [`docs/workflows/product-installer.md`](./docs/workflows/product-installer.md)
+- Source / developer / release maintainer workflows: continue with this section, the quick-start section below, and [`docs/workflows/product-installer-release-gates.md`](./docs/workflows/product-installer-release-gates.md)
+
+### Normal Download Users: Install the EXE
+
+If you downloaded a release installer, you do not need to install Node.js first, run `npm install`, or build from source:
+
+1. Download `CodexLark-Setup-<version>.exe`
+2. Double-click the installer and finish the wizard
+3. Use `Launch CodexLark` from the Start menu
+4. The first-run wizard checks Codex CLI, login state, and Feishu settings, then stores `FEISHU_APP_SECRET` in local secure storage
+5. On first launch, if the window says it does not know where to send the project card yet, send `项目卡` to the bot in Feishu to bind the thread
+
+Common installed shortcuts:
+
+- `Launch CodexLark`: start the Feishu long-connection runtime for daily use
+- `Repair CodexLark`: re-check configuration, export diagnostics, or repair migration state
+- `Uninstall CodexLark`: uninstall the product
+
+The installed product files live under `Program Files\CodexLark`; runtime state, logs, diagnostics, and secret references live under `%LocalAppData%\CodexLark`. Normal users should not need to touch repository `dist\`, `node_modules\`, or build artifacts.
+
+### Release Maintainers: Build the EXE
+
+If you maintain releases and need to build the installer for download users, first make sure `Get-Command npm`, `Get-Command node`, and `Get-Command iscc` all work, then run:
+
+```powershell
+npm run build
+powershell -ExecutionPolicy Bypass -File .\scripts\package\build-installer.ps1
+```
+
+Expected outcome:
+
+- `artifacts\packaging\output\CodexLark-Setup-<version>.exe`
+- bundled `node.exe`, prebuilt `dist\`, start/repair entries, and PowerShell bridge scripts
+- installer-time runtime manifest sync before `first-run`
+
+For a full release dry-run, see [`docs/workflows/product-installer-release-dry-run.md`](./docs/workflows/product-installer-release-dry-run.md).
+
+### Source / Developers: Repository Installer
+
+If you are evaluating or debugging from the repository, you can use `Install-CodexLark.ps1` from the repo root instead of walking the manual setup path.
+
+Supported source-installer scope:
 
 - ordinary personal Windows 10/11 PCs
 - internet access available
 - `winget` already installed
+- Windows PowerShell 5.1 or PowerShell 7 in `FullLanguage` mode
 - administrator elevation allowed
 - Feishu app credentials already prepared through your out-of-band setup guide
 
@@ -101,11 +170,13 @@ Expected outcome:
 - installs missing Node.js / Codex CLI automatically
 - pauses for the user to complete Codex login
 - runs `npm install`, `npm run build`, and `node .\scripts\doctor.cjs`
+- lets you choose whether to enable logon autostart
 - generates follow-up start / repair entry scripts
 
 Notes:
 
 - if `winget` is missing, the installer stops with a clear warning
+- host-contract failures such as non-Windows hosts, restricted PowerShell language mode, or missing ScheduledTasks support fail early; AppLocker, WDAC, ExecutionPolicy, antivirus, or proxy blocks may still surface at the exact blocked operation
 - startup of the Feishu long-connection runtime still requires user confirmation
 - the manual quick-start path remains below for advanced users and troubleshooting
 

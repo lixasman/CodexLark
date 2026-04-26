@@ -51,7 +51,7 @@ English summary: [README.en.md](./README.en.md)
 4. 需要时直接接管已有任务
 5. 在同一个线程里把本机工作持续推进
 
-如果你是第一次接触这个项目，建议先看后面的“推荐首启安装器”；只有当你准备从源码仓库评估、开发或排障时，再进入“初次评估路径”。
+如果你是第一次接触这个项目，建议先看后面的“推荐安装方式”；普通使用优先走 `.exe` 安装器，只有当你准备从源码仓库评估、开发或排障时，再进入“初次评估路径”。
 
 ## 飞书常用操作：项目卡
 
@@ -98,17 +98,37 @@ English summary: [README.en.md](./README.en.md)
 
 如果飞书后台的中文菜单名和本文不完全一致，优先按权限 code / 事件 code 搜索，而不是只靠中文名称硬找。
 
-## 推荐首启安装器
+## 推荐安装方式
 
 ### 产品安装方向
 
-- 未来面向普通下载用户的主路径会收敛为 EXE 安装器 + 首次启动向导。
-- 当前仓库里的 PowerShell 安装脚本会继续保留，但定位为源码构建、开发调试和手动排障路径，而不是长期面向普通用户的主安装入口。
+- 面向普通下载用户的主路径是 `CodexLark-Setup-<version>.exe` 安装器 + 首次启动向导。
+- 仓库里的 PowerShell 安装脚本会继续保留，但定位为源码构建、开发调试和手动排障路径，而不是普通用户的主安装入口。
 
 推荐先按身份看文档：
 
 - 普通下载用户：看 [`docs/workflows/product-installer.md`](./docs/workflows/product-installer.md)
 - 源码 / 开发者 / 发布维护者：继续看本节、下方“快速开始”和 [`docs/workflows/product-installer-release-gates.md`](./docs/workflows/product-installer-release-gates.md)
+
+### 普通下载用户：直接安装 EXE
+
+如果你拿到的是发布页里的安装包，不需要先安装 Node.js、运行 `npm install` 或从源码构建：
+
+1. 下载 `CodexLark-Setup-<version>.exe`
+2. 双击安装，按向导完成安装
+3. 安装完成后使用开始菜单里的 `Launch CodexLark` 启动
+4. 首次启动向导会检查 Codex CLI、登录态和飞书配置，并把 `FEISHU_APP_SECRET` 存到本机安全存储
+5. 第一次启动后，如果窗口提示还不知道要把项目卡发给谁，在飞书里给机器人发送 `项目卡` 完成线程绑定
+
+安装后常用入口：
+
+- `Launch CodexLark`：启动飞书长连接与日常使用入口
+- `Repair CodexLark`：重新检查配置、导出诊断或修复迁移状态
+- `Uninstall CodexLark`：卸载程序
+
+EXE 安装形态默认把产品文件放在 `Program Files\CodexLark`，把运行状态、日志、diagnostics 和 secret 引用放在 `%LocalAppData%\CodexLark` 下；普通用户不需要接触仓库里的 `dist\`、`node_modules\` 或构建产物。
+
+### 发布维护者：构建 EXE
 
 如果你是在维护发布流程、准备给普通用户打 EXE 安装包，请先完成本地构建并确认 `Get-Command npm`、`Get-Command node`、`Get-Command iscc` 都可用，然后运行：
 
@@ -135,7 +155,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package\run-product-installer
 - 默认会通过当前 Node 的真实 `process.execPath` 解析要内置的 `node.exe`
 - 如果你的开发机用了 Volta / nvs / 其他 shim 管理器，且你想显式指定打包进去的 Node，可传 `-BundledNodePath <node.exe 全路径>`
 
-如果你是从源码仓库开始评估、调试或维护这个项目，建议优先使用仓库根目录的 `Install-CodexLark.ps1`，而不是直接手动逐步配置。
+### 源码 / 开发者：仓库安装器
+
+如果你是从源码仓库开始评估、调试或维护这个项目，可以使用仓库根目录的 `Install-CodexLark.ps1`，而不是直接手动逐步配置。
 
 适用范围：
 
