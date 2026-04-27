@@ -116,6 +116,7 @@ English summary: [README.en.md](./README.en.md)
 推荐先按身份看文档：
 
 - 普通下载用户：优先看本 README 的“源码版安装（推荐）”和 [B 站部署视频](https://www.bilibili.com/video/BV1bsoCB5EsF/)
+- 安装器细节与后续签名发布说明：看 [`docs/workflows/product-installer.md`](./docs/workflows/product-installer.md)
 - 源码 / 开发者 / 发布维护者：继续看本节、下方“快速开始”和 [`docs/workflows/product-installer-release-gates.md`](./docs/workflows/product-installer-release-gates.md)
 
 ### 源码版安装（推荐）
