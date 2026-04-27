@@ -622,6 +622,7 @@ test("inspectCodexCliDependency rejects unrelated semver output even when login 
     const result = await module.inspectCodexCliDependency({
       env: {
         ...process.env,
+        OPENAI_API_KEY: "",
         COMMUNICATE_CODEX_HOME: tempRoot
       },
       resolveCommand: (command) => (command === "codex" ? codexPath : undefined),
@@ -657,6 +658,7 @@ test("inspectCodexCliDependency rejects wrapper text that only mentions a Codex 
     const result = await module.inspectCodexCliDependency({
       env: {
         ...process.env,
+        OPENAI_API_KEY: "",
         COMMUNICATE_CODEX_HOME: tempRoot
       },
       resolveCommand: (command) => (command === "codex" ? codexPath : undefined),
@@ -692,6 +694,7 @@ test("inspectCodexCliDependency rejects slash-style wrapper version output", asy
     const result = await module.inspectCodexCliDependency({
       env: {
         ...process.env,
+        OPENAI_API_KEY: "",
         COMMUNICATE_CODEX_HOME: tempRoot
       },
       resolveCommand: (command) => (command === "codex" ? codexPath : undefined),
