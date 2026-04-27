@@ -40,6 +40,22 @@ function Save-ReleaseDryRunSummary {
   [System.IO.File]::WriteAllText($Path, $json, [System.Text.UTF8Encoding]::new($false))
 }
 
+function Get-ReleaseDryRunSha256 {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path
+  )
+
+  $stream = [System.IO.File]::OpenRead($Path)
+  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = $sha256.ComputeHash($stream)
+    return (-join ($bytes | ForEach-Object { $_.ToString('x2') })).ToUpperInvariant()
+  } finally {
+    $sha256.Dispose()
+    $stream.Dispose()
+  }
+}
+
 function Resolve-ReleaseDryRunCommandSource {
   param(
     [Parameter(Mandatory = $true)][string]$Name,
@@ -272,11 +288,11 @@ try {
     throw 'Packaging completed without a CodexLark-Setup-*.exe output.'
   }
 
-  $hash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
+  $hash = Get-ReleaseDryRunSha256 -Path $installer.FullName
   $summary.installer = [ordered]@{
     path = $installer.FullName
     lastWriteTimeUtc = $installer.LastWriteTimeUtc.ToString('o')
-    sha256 = $hash.Hash
+    sha256 = $hash
   }
   $summary.manualValidation = @(
     'Fresh install the new EXE on a clean Windows machine.',
@@ -291,7 +307,7 @@ try {
 
   Write-Host ''
   Write-Host "Release dry-run package ready: $($installer.FullName)"
-  Write-Host "SHA256: $($hash.Hash)"
+  Write-Host "SHA256: $hash"
   Write-Host "Summary: $summaryPath"
   Write-Host "Logs: $releaseRoot"
   Write-Host ''

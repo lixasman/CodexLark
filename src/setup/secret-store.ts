@@ -138,7 +138,10 @@ function protectSecretWithDpapi(secret: string, env: NodeJS.ProcessEnv = process
       "-ExecutionPolicy",
       "Bypass",
       "-Command",
-      "$secure = ConvertTo-SecureString -String $env:CODEXLARK_SETUP_SECRET_VALUE -AsPlainText -Force; ConvertFrom-SecureString -SecureString $secure"
+      "Add-Type -AssemblyName System.Security; " +
+        "$secretBytes = [System.Text.Encoding]::Unicode.GetBytes($env:CODEXLARK_SETUP_SECRET_VALUE); " +
+        "$protectedBytes = [System.Security.Cryptography.ProtectedData]::Protect($secretBytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser); " +
+        "-join ($protectedBytes | ForEach-Object { $_.ToString('x2') })"
     ],
     {
       encoding: "utf8",
@@ -172,10 +175,14 @@ function unprotectSecretWithDpapi(protectedValue: string, env: NodeJS.ProcessEnv
       "-ExecutionPolicy",
       "Bypass",
       "-Command",
-      "$secure = ConvertTo-SecureString -String $env:CODEXLARK_SETUP_PROTECTED_SECRET; " +
-        "$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure); " +
-        "try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } " +
-        "finally { if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) } }"
+      "Add-Type -AssemblyName System.Security; " +
+        "$protectedValue = $env:CODEXLARK_SETUP_PROTECTED_SECRET; " +
+        "if ($protectedValue.Length % 2 -ne 0 -or $protectedValue -notmatch '^[0-9A-Fa-f]+$') { throw 'Invalid DPAPI payload.' }; " +
+        "$byteCount = [int]($protectedValue.Length / 2); " +
+        "$protectedBytes = New-Object byte[] $byteCount; " +
+        "for ($index = 0; $index -lt $byteCount; $index++) { $protectedBytes[$index] = [Convert]::ToByte($protectedValue.Substring($index * 2, 2), 16) }; " +
+        "$secretBytes = [System.Security.Cryptography.ProtectedData]::Unprotect($protectedBytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser); " +
+        "[System.Text.Encoding]::Unicode.GetString($secretBytes)"
     ],
     {
       encoding: "utf8",

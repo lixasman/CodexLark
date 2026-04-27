@@ -227,8 +227,9 @@ test('run-admin-task does not require FEISHU_APP_SECRET in resolve-launch-env st
   assert.match(launchFunction, /Add-Member[\s\S]*FEISHU_APP_SECRET/);
   assert.doesNotMatch(launchFunction, /\$result\.runtimeEnv\.FEISHU_APP_SECRET/);
   assert.match(secretFunction, /feishuAppSecretRef/);
-  assert.match(secretFunction, /ConvertTo-SecureString -String \$protectedValue/);
-  assert.match(secretFunction, /PtrToStringBSTR/);
+  assert.match(script, /function ConvertFrom-DpapiProtectedString\s*\{/);
+  assert.match(secretFunction, /ConvertFrom-DpapiProtectedString -ProtectedValue \$protectedValue/);
+  assert.match(script, /ProtectedData\]::Unprotect/);
 });
 
 test('run-admin-task preserves source-repo fallback when bundled node.exe is absent', () => {
@@ -445,6 +446,7 @@ test('run-admin-task resolves canonical Feishu secret locally instead of reading
   const stateRoot = path.join(tempRoot, 'state');
   const bootstrapLog = path.join(tempRoot, 'bootstrap.err.log');
   const invokeFunction = extractPowerShellFunction(script, 'Invoke-SetupCliJsonCommand');
+  const dpapiFunction = extractPowerShellFunction(script, 'ConvertFrom-DpapiProtectedString');
   const secretFunction = extractPowerShellFunction(script, 'Resolve-CanonicalFeishuAppSecret');
   const launchFunction = extractPowerShellFunction(script, 'Resolve-CanonicalLaunchEnvironment');
   const probeScript = [
@@ -454,10 +456,14 @@ test('run-admin-task resolves canonical Feishu secret locally instead of reading
     `$runtimePaths = [pscustomobject]@{ configRoot = '${configRoot.replace(/'/g, "''")}'; stateRoot = '${stateRoot.replace(/'/g, "''")}' }`,
     'function Write-BootstrapFailureLog { param([string]$Message) Add-Content -LiteralPath $bootstrapLog -Value $Message -Encoding utf8 }',
     invokeFunction,
+    dpapiFunction,
     secretFunction,
     launchFunction,
     "New-Item -ItemType Directory -Force -Path $runtimePaths.configRoot,(Join-Path $runtimePaths.stateRoot 'secrets') | Out-Null",
-    "$protected = ConvertFrom-SecureString -SecureString (ConvertTo-SecureString -String 'secret-local-only' -AsPlainText -Force)",
+    "Add-Type -AssemblyName System.Security",
+    "$secretBytes = [System.Text.Encoding]::Unicode.GetBytes('secret-local-only')",
+    "$protectedBytes = [System.Security.Cryptography.ProtectedData]::Protect($secretBytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)",
+    "$protected = -join ($protectedBytes | ForEach-Object { $_.ToString('x2') })",
     "$settingsJson = [ordered]@{ feishuAppId = 'app-from-cli'; feishuAppSecretRef = 'secret://feishu-app-secret' } | ConvertTo-Json -Compress",
     "[System.IO.File]::WriteAllText((Join-Path $runtimePaths.configRoot 'settings.json'), $settingsJson, [System.Text.UTF8Encoding]::new($false))",
     "$recordJson = [ordered]@{ protectedValue = $protected } | ConvertTo-Json -Compress",

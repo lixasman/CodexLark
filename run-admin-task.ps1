@@ -190,6 +190,30 @@ function Initialize-BootstrapEnvironmentCrypto {
   Add-Type -AssemblyName System.Security
 }
 
+function ConvertFrom-DpapiProtectedString {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProtectedValue
+  )
+
+  if ($ProtectedValue.Length % 2 -ne 0 -or $ProtectedValue -notmatch '^[0-9A-Fa-f]+$') {
+    throw 'Stored setup secret is not a valid DPAPI payload.'
+  }
+
+  Add-Type -AssemblyName System.Security
+  $byteCount = [int]($ProtectedValue.Length / 2)
+  $protectedBytes = New-Object byte[] $byteCount
+  for ($index = 0; $index -lt $byteCount; $index++) {
+    $protectedBytes[$index] = [Convert]::ToByte($ProtectedValue.Substring($index * 2, 2), 16)
+  }
+
+  $secretBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+    $protectedBytes,
+    $null,
+    [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+  )
+  return [System.Text.Encoding]::Unicode.GetString($secretBytes)
+}
+
 function Write-BootstrapEnvironmentPayload {
   Initialize-BootstrapEnvironmentCrypto
   $payload = [ordered]@{}
@@ -394,15 +418,7 @@ function Resolve-CanonicalFeishuAppSecret {
     throw "Stored setup secret is empty: $recordPath"
   }
 
-  $secure = ConvertTo-SecureString -String $protectedValue
-  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-  try {
-    $secret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-  } finally {
-    if ($bstr -ne [IntPtr]::Zero) {
-      [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-    }
-  }
+  $secret = ConvertFrom-DpapiProtectedString -ProtectedValue $protectedValue
 
   if ([string]::IsNullOrWhiteSpace($secret)) {
     throw "Resolved setup secret is empty: $recordPath"

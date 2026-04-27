@@ -409,6 +409,15 @@ function runLoginProbe(
   const commands = createFakeCommands(repoRoot);
   const scriptLines = [
     ...buildInstallProbePrelude(repoRoot),
+    'function global:Get-EffectiveEnvValue {',
+    '  param([Parameter(Mandatory = $true)][string]$Name)',
+    "  if ($Name -eq 'OPENAI_API_KEY') { return $null }",
+    "  $processValue = [Environment]::GetEnvironmentVariable($Name, 'Process')",
+    '  if (-not [string]::IsNullOrWhiteSpace($processValue)) { return $processValue }',
+    "  $userValue = [Environment]::GetEnvironmentVariable($Name, 'User')",
+    '  if (-not [string]::IsNullOrWhiteSpace($userValue)) { return $userValue }',
+    '  return $null',
+    '}',
     `function global:Read-Host { param([string]$Prompt) return '' }`,
     `$env:COMMUNICATE_CODEX_HOME = '${escapePowerShellSingleQuoted(commands.codexHome)}'`,
     `$env:CODEX_HOME = '${escapePowerShellSingleQuoted(commands.codexHome)}'`,

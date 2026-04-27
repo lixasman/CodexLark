@@ -524,7 +524,7 @@ test("legacy PowerShell scan commands survive the real node-to-powershell comman
     assert.deepEqual(JSON.parse(shortcutOutput.trim()), []);
     assert.ok(Array.isArray(scheduledTaskPayload.items));
     assert.ok(Array.isArray(scheduledTaskPayload.warnings));
-    assert.match(legacyScanModule.buildWindowsScheduledTaskScanCommand?.() ?? "", /鎷掔粷璁块棶|鏉冮檺/);
+    assert.match(legacyScanModule.buildWindowsScheduledTaskScanCommand?.() ?? "", /拒绝访问|权限/);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EPERM") {
       t.skip("Node child_process cannot spawn powershell.exe in this environment.");
