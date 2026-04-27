@@ -8,6 +8,13 @@ CodexLark 是一个面向 Windows + PowerShell 的个人工作流产品，让你
 
 English summary: [README.en.md](./README.en.md)
 
+## 安装提示
+
+当前 Release 上传的 `.exe` 安装包由于没有软件签名，可能会被 Windows / 浏览器 / Microsoft Defender SmartScreen 拦截。为了避免安装时被风控卡住，建议大家直接下载源码版并按部署视频安装。
+
+- 源码版安装：在 GitHub 页面点击 `Code` -> `Download ZIP`，解压后运行仓库安装器
+- 详细部署视频（包含飞书开放平台配置与源码版安装）：[B 站视频教程](https://www.bilibili.com/video/BV1bsoCB5EsF/)
+
 ## 为什么要用
 
 - 重启之后还能找回上下文和任务入口
@@ -51,7 +58,7 @@ English summary: [README.en.md](./README.en.md)
 4. 需要时直接接管已有任务
 5. 在同一个线程里把本机工作持续推进
 
-如果你是第一次接触这个项目，建议先看后面的“推荐安装方式”；普通使用优先走 `.exe` 安装器，只有当你准备从源码仓库评估、开发或排障时，再进入“初次评估路径”。
+如果你是第一次接触这个项目，建议先看后面的“推荐安装方式”和部署视频；当前普通使用优先下载源码版，不建议把未签名 `.exe` 作为主安装路径。
 
 ## 飞书常用操作：项目卡
 
@@ -74,7 +81,7 @@ English summary: [README.en.md](./README.en.md)
 
 ## 源码 / 手动路径环境要求
 
-如果你走 EXE 安装器的普通下载用户路径，可以先跳过这一节；下面这些前置条件主要适用于源码构建、手动排障和开发者路径。
+当前建议直接下载源码版并运行仓库安装器；下面这些前置条件适用于源码版安装、手动排障和开发者路径。
 
 - Windows
 - PowerShell
@@ -84,7 +91,7 @@ English summary: [README.en.md](./README.en.md)
 
 ## 飞书开放平台最小配置
 
-源码路径下的仓库安装器可以帮你装 Node.js、Codex CLI 和本地依赖，但不会替你自动完成飞书开放平台里的应用配置；如果你是普通下载用户，请优先看 EXE 安装器路径，不必把这些当成全局前置条件。
+源码路径下的仓库安装器可以帮你装 Node.js、Codex CLI 和本地依赖，但不会替你自动完成飞书开放平台里的应用配置。完整飞书配置和源码版安装流程可以参考：[B 站部署视频](https://www.bilibili.com/video/BV1bsoCB5EsF/)。
 
 如果你是第一次接触飞书开放平台，至少先完成下面这些前置项，再回来执行安装器或手动启动：
 
@@ -102,25 +109,44 @@ English summary: [README.en.md](./README.en.md)
 
 ### 产品安装方向
 
-- 面向普通下载用户的主路径是 `CodexLark-Setup-<version>.exe` 安装器 + 首次启动向导。
-- 仓库里的 PowerShell 安装脚本会继续保留，但定位为源码构建、开发调试和手动排障路径，而不是普通用户的主安装入口。
+- 当前 Release 上传的 `.exe` 安装包还没有软件签名，可能会被系统风控拦截。
+- 现阶段推荐大家直接下载源码版，并使用仓库里的 PowerShell 安装脚本完成安装。
+- `.exe` 安装包会继续保留为预发布测试包；后续如果完成代码签名，再切换为普通用户主安装入口。
 
 推荐先按身份看文档：
 
-- 普通下载用户：看 [`docs/workflows/product-installer.md`](./docs/workflows/product-installer.md)
+- 普通下载用户：优先看本 README 的“源码版安装（推荐）”和 [B 站部署视频](https://www.bilibili.com/video/BV1bsoCB5EsF/)
 - 源码 / 开发者 / 发布维护者：继续看本节、下方“快速开始”和 [`docs/workflows/product-installer-release-gates.md`](./docs/workflows/product-installer-release-gates.md)
 
-### 普通下载用户：直接安装 EXE
+### 源码版安装（推荐）
 
-如果你拿到的是发布页里的安装包，不需要先安装 Node.js、运行 `npm install` 或从源码构建：
+如果你不熟悉 Git，可以直接下载源码压缩包：
 
-1. 下载 `CodexLark-Setup-<version>.exe`
-2. 双击安装，按向导完成安装
-3. 安装完成后使用开始菜单里的 `Launch CodexLark` 启动
-4. 首次启动向导会检查 Codex CLI、登录态和飞书配置，并把 `FEISHU_APP_SECRET` 存到本机安全存储
-5. 第一次启动后，如果窗口提示还不知道要把项目卡发给谁，在飞书里给机器人发送 `项目卡` 完成线程绑定
+1. 打开 GitHub 项目页面
+2. 点击 `Code`
+3. 点击 `Download ZIP`
+4. 解压源码压缩包
+5. 在解压后的目录里打开 PowerShell
+6. 运行仓库安装器：
 
-安装后常用入口：
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Install-CodexLark.ps1
+```
+
+安装器会检查或安装 Node.js / Codex CLI、引导 Codex 登录、收集飞书配置、安装依赖、构建项目，并生成后续启动与修复入口：
+
+- `Start-CodexLark.ps1`：日常启动飞书长连接
+- `Repair-CodexLark.ps1`：重新检查配置、导出诊断或修复迁移状态
+
+完整演示见：[B 站部署视频](https://www.bilibili.com/video/BV1bsoCB5EsF/)。
+
+### EXE 预发布测试包说明
+
+Release 里的 `CodexLark-Setup-<version>.exe` 目前暂未做代码签名，Windows / 浏览器 / Microsoft Defender SmartScreen 可能会提示“通常不会下载”或“无法识别的应用”。这不等同于已检测到病毒，但表示该安装包尚未建立发布者/文件信誉。
+
+如果你不了解这些风险，请直接下载源码版；如果你只是参与测试，请先校验 Release 里的 SHA256，再决定是否安装。
+
+EXE 安装后常用入口：
 
 - `Launch CodexLark`：启动飞书长连接与日常使用入口
 - `Repair CodexLark`：重新检查配置、导出诊断或修复迁移状态
